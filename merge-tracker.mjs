@@ -34,6 +34,7 @@ import { resolveTrackerPath, resolveWorkspaceRoot, resolvePdfIndexPath, trackerL
 // Canonical posting-URL key. Kept in its own module so scan.mjs / scan-history
 // can adopt the same key later without the definitions drifting.
 import { normalizeUrl } from './url-key.mjs';
+import { fingerprintText, similarity as fingerprintSimilarity, CROSSLIST_THRESHOLD } from './fingerprint-core.mjs';
 
 const MERGE_TRACKER_HELP_REQUESTED = process.argv.includes('--help') || process.argv.includes('-h');
 if (MERGE_TRACKER_HELP_REQUESTED) {
@@ -282,6 +283,46 @@ function resolveReportUrl(reportField) {
   // into the column would hand every such row the same key.
   const raw = m[1].replace(/^<|>$/g, '').replace(/[),.;]+$/, '');
   return normalizeUrl(raw) ? { url: raw, reason: 'ok' } : { url: '', reason: 'no-url' };
+}
+
+/**
+ * Read a report's archived JD body (`## Job Description (archived verbatim)`,
+ * per AGENTS.md → "JD archival is REQUIRED, not optional (#2789)"), for the
+ * promotion-layer same-company/fuzzy-role similarity check below.
+ *
+ * OBSERVATIONAL ONLY — mirrors resolveReportUrl()'s exact containment guard
+ * (same REPORTS_ROOT resolve + startsWith check) rather than inventing a new
+ * one. Older reports predating #2789, or one whose JD lives in a `jds/`
+ * capture instead of the embedded section, simply yield '' — never an error —
+ * which the caller treats as "nothing to compare," not as evidence either way.
+ *
+ * @param {string} reportField - Report cell, e.g. `[42](reports/042-acme.md)`.
+ * @returns {string} The archived JD body, or '' when unavailable.
+ */
+function extractArchivedJd(reportField) {
+  const linkMatch = (reportField || '').match(/\]\(([^)]+)\)/);
+  if (!linkMatch) return '';
+  const reportPath = resolve(REPORTS_ROOT, linkMatch[1].trim().replace(/^(\.\.\/)+/, ''));
+  if (!reportPath.startsWith(REPORTS_ROOT + sep)) return '';
+  if (!existsSync(reportPath)) return '';
+  let text;
+  try { text = readFileSync(reportPath, 'utf-8'); } catch { return ''; }
+  // From the archival heading to the next level-2 heading or EOF. Case/spacing
+  // tolerant on the heading text itself, but anchored to `## ` so an
+  // unrelated line merely mentioning "job description" is never captured.
+  //
+  // Deliberately NOT one combined regex with `$` inside the lazy body group:
+  // with the `m` flag (needed to anchor `^##` to a LINE, not the whole file),
+  // `$` matches the end of EVERY line, so a lazy `[\s\S]*?` stops at the very
+  // first line break in the body — an 11-char JD instead of an 11,000-char
+  // one. Two plain string searches over the post-heading slice have no such
+  // trap: `$` never appears in either.
+  const headingMatch = text.match(/^##\s+Job Description \(archived verbatim\)\s*$/mi);
+  if (!headingMatch) return '';
+  const rest = text.slice(headingMatch.index + headingMatch[0].length);
+  const nextHeadingIdx = rest.search(/\n##\s/);
+  const body = nextHeadingIdx === -1 ? rest : rest.slice(0, nextHeadingIdx);
+  return body.trim();
 }
 
 // Matches the req/job-number labels actually seen in this tracker's free-text
@@ -1574,6 +1615,29 @@ for (const file of tsvFiles) {
     };
     duplicate = existingApps.find(app => fuzzyTierMatch(app, false))
       || existingApps.find(app => fuzzyTierMatch(app, true));
+
+    // Same-company/fuzzy-role promotion-time JD-similarity check (warn-only,
+    // #dedup-investigation-2026-09-06 — the promotion-layer sibling of the
+    // scan.mjs ingestion-time check). ONLY runs for a match found by
+    // fuzzyTierMatch above — an exact URL/report/entry-number match earlier in
+    // this function is already a sure duplicate and is never second-guessed
+    // here. OBSERVATIONAL: never blocks, alters, or skips the merge below —
+    // it only prints, and only when BOTH sides' archived JD is actually
+    // available (see extractArchivedJd — a missing report, a pre-#2789 report
+    // with no archived section, or a jds/-capture-only JD all yield '' and are
+    // silently skipped, exactly like a job with no fingerprint in scan.mjs).
+    if (duplicate) {
+      const additionJd = extractArchivedJd(addition.report);
+      const appJd = extractArchivedJd(duplicate.report);
+      const additionFp = fingerprintText(additionJd);
+      const appFp = fingerprintText(appJd);
+      if (additionFp && appFp) {
+        const score = fingerprintSimilarity(additionFp, appFp);
+        if (score < CROSSLIST_THRESHOLD) {
+          console.log(`⚠️  ${file}: fuzzy company+role match to #${duplicate.num} ${duplicate.company} — ${duplicate.role}, but archived JD text differs materially (≈${Math.round(score * 100)}% similar) — this may be a DIFFERENT requisition. Merging anyway (unchanged behavior); verify manually before trusting the merged row.`);
+        }
+      }
+    }
   }
 
   if (duplicate) {

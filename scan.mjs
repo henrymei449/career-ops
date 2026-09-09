@@ -63,7 +63,7 @@ import { buildTrustValidator } from './providers/_trust-validator.mjs';
 import { loadProviders, resolveProvider } from './providers/_registry.mjs';
 import { mergeProviderPlugins } from './plugins/_engine.mjs';
 import { classifyFetchError } from './verify-portals.mjs';
-import { fingerprintText, findCrossListings } from './fingerprint-core.mjs';
+import { fingerprintText, findCrossListings, similarity as fingerprintSimilarity, CROSSLIST_THRESHOLD, CROSSLIST_WINDOW_DAYS } from './fingerprint-core.mjs';
 import { resolveColumns, parseTrackerRow, normalizeTextKey } from './tracker-parse.mjs';
 import { normalizeCompany } from './tracker-utils.mjs';
 import { normalizeCompanyName } from './invite-match.mjs';
@@ -1940,6 +1940,138 @@ export function companyRoleDedupKey(company, role, canonicalize = defaultCompany
   return places ? `${base}@@${places}` : base;
 }
 
+// A markdown JD cache written by plugins/apify/index.mjs's saveJd(): a YAML
+// frontmatter block, then `# {title} — {company}`, then the body. Strips both
+// so the fingerprint runs over JD content only — title/company differ between
+// same-req siblings by construction (that's the whole key we just matched on)
+// and would otherwise inject per-file noise into the shingle stream.
+const JD_CACHE_HEADING_RE = /^\s*#[^\n]*\n+/;
+
+/**
+ * Resolve a job's JD body text for fingerprinting, when the job object itself
+ * doesn't carry one.
+ *
+ * Producer plugins (e.g. the bundled `apify` provider, see its `useLocalJd`
+ * path) that cache the JD to `jds/*.md` never keep the raw description on the
+ * returned Job object — only `local:jds/{file}` survives as `job.url`. Without
+ * this, `job.description` is undefined for every such job and the same-company
+ * similarity check below would silently never fire for exactly the sources
+ * (Apify/LinkedIn) this investigation was about.
+ *
+ * Read-only, best-effort: a missing/unreadable file yields '', which
+ * `fingerprintText` already treats as unfingerprintable — never a crash, never
+ * a false signal.
+ *
+ * @param {{description?: unknown, url?: unknown}} job
+ * @returns {string} JD body text, or '' when none is available.
+ */
+export function resolveJobDescriptionText(job) {
+  if (typeof job?.description === 'string' && job.description) return job.description;
+  const url = typeof job?.url === 'string' ? job.url : '';
+  if (!url.startsWith('local:')) return '';
+  try {
+    const relPath = url.slice('local:'.length);
+    const absPath = path.join(getCareerOpsRoot(), relPath);
+    const raw = readFileSync(absPath, 'utf-8');
+    // Frontmatter is `---\n...\n---\n`; split(...)[2] is everything after the
+    // closing fence (join back in case the body itself contains a bare `---`).
+    const parts = raw.split('---\n');
+    if (parts.length < 3) return '';
+    const rest = parts.slice(2).join('---\n');
+    return rest.replace(JD_CACHE_HEADING_RE, '').trim();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Same-company/same-role cross-run and cross-SOURCE JD-similarity check
+ * (OBSERVATIONAL ONLY — Phase 1B, #dedup-investigation-2026-09-06).
+ *
+ * The sibling of the same-RUN check wired into the per-entry loop above: that
+ * one catches two city variants of one req discovered in the SAME scan (the
+ * shape behind every Oden/TRACTIAN/WorkWave/Deloitte pair observed so far).
+ * This one catches the shape those checks structurally cannot — a same-req
+ * pair discovered on DIFFERENT days or through DIFFERENT sources (an ATS scan
+ * Monday, a LinkedIn scan Wednesday) — by comparing against
+ * `scan-history.tsv`'s own persisted fingerprint column instead of only
+ * against jobs found in the current run.
+ *
+ * Deliberately NOT a tweak to `findCrossListings`: that function's whole
+ * point is comparing DIFFERENT-company pairs and skipping same-company ones
+ * as reposts; inverting its company check in place would silently change what
+ * findCrossListings itself does. A separate pass keeps both fully independent
+ * and auditable, at the cost of one extra O(offers × history) grouping pass —
+ * bucketing history by company+role key first keeps that cost linear rather
+ * than quadratic, same technique findCrossListings itself uses for the
+ * company key.
+ *
+ * THREE outcomes per pair, not two: unlike findCrossListings (which only ever
+ * reports a match), a pair sharing company+role with EITHER side missing a
+ * usable fingerprint is still reported, as 'unavailable' — per this phase's
+ * explicit requirement not to let company+title alone stand in for a content
+ * comparison that was never actually made.
+ *
+ * @param {Array<{url:string, company:string, title:string, location?:string, fingerprint?:string}>} offers
+ *   This run's newly-verified offers (fingerprints already computed by the
+ *   caller — see the `resolveJobDescriptionText` note above 5.7).
+ * @param {Array<{url:string, dateStr:string, company:string, title:string, fingerprint:string, location?:string, portal?:string}>} historyRows
+ *   From `collectFingerprintHistory` — rows that already carry a fingerprint
+ *   are the only ones with a URL/date attached in this shape, so a row absent
+ *   from `historyRows` is "never fingerprinted", already folded into the
+ *   'unavailable' outcome without a separate lookup.
+ * @param {(name: unknown) => string} canonicalizeCompany
+ * @param {{today?: Date, windowDays?: number}} [opts] - Same window semantics
+ *   as findCrossListings, reused for consistency (a repost from a year ago is
+ *   as unlikely to be "the same live req" as a cross-company one is).
+ * @returns {Array<{company:string, title:string, newLocation:string, newUrl:string, priorLocation:string, priorUrl:string, priorSource:string, priorDate:string, status:'high'|'low'|'unavailable', score:number|null}>}
+ */
+export function findSameCompanyCrossRunPairs(offers, historyRows, canonicalizeCompany, opts = {}) {
+  const windowDays = opts.windowDays ?? CROSSLIST_WINDOW_DAYS;
+  const today = opts.today ? new Date(opts.today) : new Date();
+  const cutoff = today.getTime() - windowDays * 86400000;
+
+  const byKey = new Map();
+  for (const row of historyRows) {
+    const t = Date.parse(row.dateStr);
+    if (Number.isNaN(t) || t < cutoff) continue;
+    const key = companyRoleDedupKey(row.company, row.title, canonicalizeCompany);
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(row);
+  }
+
+  const results = [];
+  for (const offer of offers) {
+    const key = companyRoleDedupKey(offer.company, offer.title, canonicalizeCompany);
+    const candidates = byKey.get(key);
+    if (!candidates) continue;
+    for (const row of candidates) {
+      if (row.url === offer.url) continue; // the same posting re-seen, not a pair
+      let status, score;
+      if (!offer.fingerprint || !row.fingerprint) {
+        status = 'unavailable';
+        score = null;
+      } else {
+        score = fingerprintSimilarity(offer.fingerprint, row.fingerprint);
+        status = score >= CROSSLIST_THRESHOLD ? 'high' : 'low';
+      }
+      results.push({
+        company: offer.company,
+        title: offer.title,
+        newLocation: offer.location || '',
+        newUrl: offer.url,
+        priorLocation: row.location || '',
+        priorUrl: row.url,
+        priorSource: row.portal || '',
+        priorDate: row.dateStr,
+        status,
+        score,
+      });
+    }
+  }
+  return results;
+}
+
 /**
  * Build the seen-role set from the same three sources as `loadSeenUrls`.
  *
@@ -2249,7 +2381,13 @@ export function formatScanHistoryRow(offer, date, status = 'added') {
  * text ('' for an absent file), like its `collect*` siblings.
  *
  * @param {string} [scanHistoryText] - Full scan-history.tsv contents.
- * @returns {Array<{url: string, dateStr: string, company: string, title: string, fingerprint: string}>}
+ * `location` (col 6) and `portal` (col 2) are additive (Phase 1B,
+ * #dedup-investigation-2026-09-06): findCrossListings only ever destructured
+ * the original five fields, so carrying two more is backward compatible.
+ * They exist so a same-company cross-run match can show "both locations" and
+ * "both sources" without a second file read.
+ *
+ * @returns {Array<{url: string, dateStr: string, title: string, company: string, fingerprint: string, location: string, portal: string}>}
  */
 export function collectFingerprintHistory(scanHistoryText = '') {
   const rows = [];
@@ -2267,6 +2405,8 @@ export function collectFingerprintHistory(scanHistoryText = '') {
       title: (cols[3] || '').trim(),
       company: (cols[4] || '').trim(),
       fingerprint: cols[7].trim(),
+      location: (cols[6] || '').trim(),
+      portal: (cols[2] || '').trim(),
     });
   }
   return rows;
@@ -2752,7 +2892,7 @@ function guardStatusFor(code) {
 const KNOWN_FLAGS = [
   '--dry-run', '--verify', '--headed-fallback', '--throttle', '--rediscover-404',
   '--include-blacklisted', '--company', '--posted-after', '--posted-before',
-  '--since', '--quiet', '--json', '--help', '-h',
+  '--since', '--quiet', '--json', '--help', '-h', '--timing',
 ];
 
 // Flags whose space-separated value is the NEXT argv token (the `--flag=value`
@@ -2776,12 +2916,18 @@ const USAGE = `Usage:
   node scan.mjs --posted-before 2026-08-01   # absolute upper bound on posting date
   node scan.mjs --json                       # emit one machine-readable receipt on stdout
   node scan.mjs --quiet                      # suppress the manifesto footer
+  node scan.mjs --timing                     # print one per-company timing line (wall time, job count, Workday clamp/slices)
   node scan.mjs --help                       # print this usage block and exit`;
 
 async function main() {
   const args = process.argv.slice(2);
   validateFlags(args, KNOWN_FLAGS, USAGE, { valueFlags: VALUE_FLAGS });
   const dryRun = args.includes('--dry-run');
+  // Perf investigation aid (#PERF-2026-09-07) — not a telemetry framework,
+  // just one console.error line per company so a clamped-tenant fix (bounded
+  // Workday facet-slice concurrency) can be measured before/after. Stderr
+  // only, so it never touches --json's stdout contract.
+  const timing = hasFlag(args, '--timing');
   const jsonMode = args.includes('--json');
   if (jsonMode) console.log = console.error.bind(console);
   const verify = args.includes('--verify');
@@ -3010,6 +3156,15 @@ async function main() {
   let annotatedBlacklisted = 0;
   let totalFilteredVisa = 0;
   let totalDupes = 0;
+  // Same-company/same-role JD-similarity observability (warn-only — see
+  // "Cross-listing check" below for the sibling cross-COMPANY mechanism this
+  // mirrors). `collectSeenCompanyRoles`'s dedup runs BEFORE this point ever
+  // sees a rejected sibling, so the only way to compare a same-run pair (the
+  // common case: two cities from ONE Apify/ATS batch) is to capture the
+  // WINNING job's fingerprint here, at add-time, and compare a later same-key
+  // rejection against it before that job is discarded by `continue`.
+  const companyRoleWinners = new Map();
+  const sameCompanyChecks = [];
   const newOffers = [];
   const errors = [...resolveErrors];
   const emptyTargets = [];
@@ -3063,6 +3218,7 @@ async function main() {
       locationHints: config.location_filter,
     };
     let sourceName = provider.id === 'local-parser' ? 'local-parser' : `${provider.id}-api`;
+    const timingStartedAt = timing ? Date.now() : 0;
     try {
       let jobs;
       try {
@@ -3081,6 +3237,13 @@ async function main() {
       }
       if (!Array.isArray(jobs)) {
         throw new Error(`${provider.id}: fetch() did not return an array`);
+      }
+      if (timing) {
+        const elapsedMs = Date.now() - timingStartedAt;
+        const clampNote = jobs.workdayClamped
+          ? ` | workday-clamped | ${jobs.workdaySliceCount ?? '?'} facet slices`
+          : '';
+        console.error(`⏱  timing | ${company.name} | ${provider.id} | ${elapsedMs}ms | ${jobs.length} jobs${clampNote}`);
       }
       totalFound += jobs.length;
       if (!company._isBoard && jobs.length === 0) {
@@ -3201,6 +3364,28 @@ async function main() {
           )
         ) {
           totalDupes++;
+          // Same-company/same-role JD-similarity observability (warn-only,
+          // #dedup-investigation-2026-09-06). This has NO effect on the
+          // decision above — the job is discarded exactly as before — it only
+          // records the pair for the summary printed after the scan loop.
+          const winner = companyRoleWinners.get(key) ?? companyRoleWinners.get(baseKey);
+          if (winner) {
+            const rejectedText = resolveJobDescriptionText(job);
+            const winnerText = resolveJobDescriptionText(winner);
+            const rejectedFp = fingerprintText(rejectedText);
+            const winnerFp = winner.fingerprint ?? fingerprintText(winnerText);
+            if (rejectedFp && winnerFp) {
+              sameCompanyChecks.push({
+                company: job.company,
+                title: job.title,
+                keptLocation: winner.location,
+                droppedLocation: job.location,
+                keptUrl: winner.url,
+                droppedUrl: job.url,
+                score: fingerprintSimilarity(rejectedFp, winnerFp),
+              });
+            }
+          }
           continue;
         }
         const cooldownResult = cooldownFilter(job);
@@ -3220,6 +3405,11 @@ async function main() {
         if (key !== null) {
           seenCompanyRoles.add(key);
           if (key !== baseKey) seenCompanyRoleBases.add(baseKey);
+          // Record the winner for the same-company similarity check above.
+          // Fingerprint computed once here (not per-rejection) and reused.
+          const winnerRecord = { company: job.company, title: job.title, location: job.location, url: job.url, fingerprint: fingerprintText(resolveJobDescriptionText(job)) };
+          companyRoleWinners.set(key, winnerRecord);
+          if (key !== baseKey) companyRoleWinners.set(baseKey, winnerRecord);
         }
         // Tag with the company's careers domain so verify can offer a 404/410
         // rediscovery fallback. A null domain (no careers_url) marks the offer
@@ -3268,13 +3458,34 @@ async function main() {
   // requirements text under two names is usually an agency re-post of a direct
   // listing (or vice versa), which URL and company+role dedup both miss.
   // Fingerprints are computed once here and reused by appendToScanHistory.
+  //
+  // resolveJobDescriptionText(), not offer.description directly
+  // (#dedup-investigation-2026-09-06 Phase 1B): a plugin whose field_map
+  // caches the JD locally (the bundled apify provider's useLocalJd path,
+  // which every LinkedIn pilot job in this repo went through) never sets
+  // `.description` on the returned Job — only `local:jds/{file}` survives as
+  // `.url`. Fingerprinting `offer.description` directly silently fingerprinted
+  // `undefined` for every such offer, writing an EMPTY fingerprint column to
+  // scan-history.tsv — confirmed on every LinkedIn row already in this repo's
+  // history. That starved BOTH this cross-company check and the same-company
+  // cross-run check below of the one persisted source (scan-history.tsv's own
+  // fingerprint column) they depend on for exactly the sources this
+  // investigation is about.
   for (const offer of verifiedOffers) {
-    offer.fingerprint = fingerprintText(offer.description);
+    offer.fingerprint = fingerprintText(resolveJobDescriptionText(offer));
   }
   // History rows come from the run-start snapshot: nothing has appended to
   // scan-history.tsv yet at this point in the run (all writes happen below),
   // so this sees the same bytes a re-read would — minus the third full parse.
   const crossListings = findCrossListings(verifiedOffers, dedupSnapshot.fingerprintHistory);
+  // Same-company/same-role cross-run/cross-source check (warn-only, Phase 1B —
+  // the sibling of the same-RUN check further up this function). Reuses the
+  // SAME fingerprintHistory snapshot findCrossListings just read; no new file
+  // I/O. See findSameCompanyCrossRunPairs()'s own doc for why this is a
+  // separate pass rather than a tweak to findCrossListings (company-match
+  // direction is inverted, and the "fingerprint unavailable" case must be
+  // reported, not silently dropped, per this phase's explicit requirement).
+  const sameCompanyCrossRun = findSameCompanyCrossRunPairs(verifiedOffers, dedupSnapshot.fingerprintHistory, canonicalizeCompany);
 
   // 6. Write results
   if (!dryRun && verifiedOffers.length > 0) {
@@ -3379,6 +3590,53 @@ async function main() {
       console.log(`    vs ${row.url}`);
     }
     console.log(`  If one side is an agency, apply through ONE channel only — a double submission burns both (#1596).`);
+  }
+  if (sameCompanyChecks.length > 0) {
+    // OBSERVATIONAL ONLY — this warn-only block has no effect on which rows
+    // were kept or dropped above (that decision, and dedup_include_location,
+    // are unchanged). CROSSLIST_THRESHOLD (0.92) is reused here purely as a
+    // reporting reference point, not a re-validated cutoff for THIS
+    // same-company comparison — it was tuned for cross-company repost
+    // detection, a different problem. Every checked pair is printed; nothing
+    // is filtered by score.
+    console.log(`\n🔎 Same-company duplicate JD similarity (observational, nothing was dropped or merged):`);
+    for (const { company, title, keptLocation, droppedLocation, keptUrl, droppedUrl, score } of sameCompanyChecks) {
+      const pct = Math.round(score * 100);
+      if (score >= CROSSLIST_THRESHOLD) {
+        console.log(`  HIGH ${pct}%  ${company} — ${title}`);
+        console.log(`    Locations seen: ${keptLocation || '(none)'} | ${droppedLocation || '(none)'}  → likely ONE requisition posted per city`);
+      } else {
+        console.log(`  LOW  ${pct}%  ${company} — ${title}`);
+        console.log(`    Locations seen: ${keptLocation || '(none)'} | ${droppedLocation || '(none)'}  → JD content differs materially; company+title dedup may have discarded a DIFFERENT opening`);
+      }
+      console.log(`    kept:    ${keptUrl}`);
+      console.log(`    dropped: ${droppedUrl}`);
+    }
+    console.log(`  Reference threshold: ${Math.round(CROSSLIST_THRESHOLD * 100)}% (tuned for cross-company reposts, not yet validated for this same-company comparison — read scores directly, don't over-trust the line).`);
+  }
+  if (sameCompanyCrossRun.length > 0) {
+    // OBSERVATIONAL ONLY, Phase 1B — the cross-run/cross-source sibling of the
+    // same-run block above. Same non-effect on behavior: nothing was dropped,
+    // merged, or re-scored because of this block existing.
+    console.log(`\n🔁 Same-company cross-run/cross-source matches (observational, nothing was dropped or merged):`);
+    for (const { company, title, newLocation, newUrl, priorLocation, priorUrl, priorSource, priorDate, status, score } of sameCompanyCrossRun) {
+      if (status === 'unavailable') {
+        console.log(`  UNAVAILABLE  ${company} — ${title}`);
+        console.log(`    Fingerprint missing on one or both sides — company+title match alone is NOT evidence this is the same requisition.`);
+      } else {
+        const pct = Math.round(score * 100);
+        if (status === 'high') {
+          console.log(`  HIGH ${pct}%  ${company} — ${title}`);
+          console.log(`    Locations seen: ${newLocation || '(none)'} | ${priorLocation || '(none)'}  → likely the SAME requisition discovered across runs/sources`);
+        } else {
+          console.log(`  LOW  ${pct}%  ${company} — ${title}`);
+          console.log(`    Locations seen: ${newLocation || '(none)'} | ${priorLocation || '(none)'}  → JD content differs materially despite matching company+title; likely a DISTINCT requisition — company+title dedup would be unsafe here`);
+        }
+      }
+      console.log(`    new:   ${newUrl}`);
+      console.log(`    prior: ${priorUrl}  (source: ${priorSource || 'unknown'}, first seen ${priorDate})`);
+    }
+    console.log(`  Reference threshold: ${Math.round(CROSSLIST_THRESHOLD * 100)}% (observational only, same caveat as above — not re-validated for this comparison).`);
   }
   if (historyPolicy.recheckAfterDays != null) {
     console.log(`Recheck eligible:      ${dedupSnapshot.recheckEligible} old scan-history URL(s)`);

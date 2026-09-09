@@ -83,9 +83,13 @@ const GOLDEN = {
     'zeta::sre',
   ],
   fingerprints: [
-    { url: 'https://boards.greenhouse.io/acme/jobs/1?utm_source=x', dateStr: '2026-08-01', title: 'Platform Engineer', company: 'Acme', fingerprint: 'fp-acme-1' },
-    { url: 'https://jobs.lever.co/beta/2', dateStr: '2026-01-01', title: 'Data Engineer', company: 'Beta', fingerprint: 'fp-beta-2' },
-    { url: 'https://boards.greenhouse.io/gamma/3', dateStr: '2026-07-01', title: 'ML Engineer', company: 'Gamma', fingerprint: 'fp-gamma-3' },
+    // location/portal added (Phase 1B, #dedup-investigation-2026-09-06):
+    // collectFingerprintHistory() now also carries these two additive fields,
+    // read straight from the same TSV columns already fixtured above (col 6 =
+    // location, col 2 = portal) — see findSameCompanyCrossRunPairs().
+    { url: 'https://boards.greenhouse.io/acme/jobs/1?utm_source=x', dateStr: '2026-08-01', title: 'Platform Engineer', company: 'Acme', fingerprint: 'fp-acme-1', location: 'Remote', portal: 'greenhouse' },
+    { url: 'https://jobs.lever.co/beta/2', dateStr: '2026-01-01', title: 'Data Engineer', company: 'Beta', fingerprint: 'fp-beta-2', location: 'Berlin', portal: 'lever' },
+    { url: 'https://boards.greenhouse.io/gamma/3', dateStr: '2026-07-01', title: 'ML Engineer', company: 'Gamma', fingerprint: 'fp-gamma-3', location: 'Remote', portal: 'greenhouse' },
   ],
 };
 
