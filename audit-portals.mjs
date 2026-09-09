@@ -54,7 +54,8 @@
  */
 
 import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import * as yaml from 'js-yaml';
 
 import { makeHttpCtx } from './providers/_http.mjs';
@@ -70,7 +71,13 @@ import { isMainModule } from './lib/is-main-module.mjs';
 // providers and report every board as `no-provider`.
 const ROOT = getCareerOpsRoot();
 const DEFAULT_PORTALS_PATH = process.env.CAREER_OPS_PORTALS || join(ROOT, 'portals.yml');
-const PROVIDERS_DIR = join(ROOT, 'providers');
+// providers/ is System Layer — it ships with the code and only ever exists under
+// the codebase root, never under a configured CAREER_OPS_DATA_DIR. Resolving it
+// through getCareerOpsRoot() made loadProviders() return an empty Map under any
+// separate data root, so every entry — including ones with a valid explicit
+// `provider:` — reported `no-provider` (#3500-class bug).
+const CODE_ROOT = dirname(fileURLToPath(import.meta.url));
+const PROVIDERS_DIR = join(CODE_ROOT, 'providers');
 
 /** Boards at or under this many postings are worth a second look, not an error. */
 export const DEFAULT_SMALL_THRESHOLD = 5;

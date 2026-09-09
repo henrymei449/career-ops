@@ -540,7 +540,19 @@ if (!existsSync(PORTALS_FILE)) {
       ...(Array.isArray(cfg.tracked_companies) ? cfg.tracked_companies : []),
       ...(Array.isArray(cfg.job_boards) ? cfg.job_boards : []),
     ];
-    const providers = await loadProviders(join(CAREER_OPS, 'providers'));
+    // providers/ is System Layer — codebase root, never the data root. Resolving
+    // it through CAREER_OPS (getCareerOpsRoot()) loaded zero providers under any
+    // configured CAREER_OPS_DATA_DIR, so this check reported every enabled entry
+    // as unclaimed, including ones with a valid explicit `provider:` (#3500-class).
+    const providers = await loadProviders(join(CODE_ROOT, 'providers'));
+    // Merge enabled keyed provider-plugins (e.g. apify) exactly as scan.mjs does,
+    // or every `provider: apify` entry reports as an unknown provider that "never
+    // scans" — false for entries that scan fine through the plugin layer at
+    // runtime. Inert when config/plugins.yml is absent; no network, no fetch.
+    try {
+      const { mergeProviderPlugins } = await import('./plugins/_engine.mjs');
+      await mergeProviderPlugins(providers, { root: CODE_ROOT, dataRoot: CAREER_OPS });
+    } catch { /* plugin layer optional — fall back to core providers only */ }
     const { silent, handoff, unknownProvider } = findUnclaimedEntries(entries, providers);
 
     // findUnclaimedEntries silently skips an entry with no (or blank) `name` —
