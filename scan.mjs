@@ -121,6 +121,12 @@ try {
 }
 
 const CONCURRENCY = 10;
+// Apify's per-account concurrent-actor-run cap (starter/free tier): launching
+// more than this many `provider: apify` runs at once fails with HTTP 402
+// "concurrent-runs-limit-exceeded" — observed launching all 10 LinkedIn
+// families under the shared CONCURRENCY=10 pool (#3512-scan-batching).
+// Scoped to the apify provider only; every other provider keeps CONCURRENCY.
+const APIFY_CONCURRENCY = 5;
 
 export function isIgnorableDirectoryFsyncError(err, platform = process.platform) {
   return ['EINVAL', 'ENOTSUP', 'ENOSYS'].includes(err?.code)
@@ -2744,7 +2750,7 @@ export function computeConsecutiveFailures(healthRecords) {
 
 // ── Parallel fetch with concurrency limit ───────────────────────────
 
-async function parallelFetch(tasks, limit) {
+export async function parallelFetch(tasks, limit) {
   const results = [];
   let i = 0;
 
@@ -2758,6 +2764,44 @@ async function parallelFetch(tasks, limit) {
   const workers = Array.from({ length: Math.min(limit, tasks.length) }, () => next());
   await Promise.all(workers);
   return results;
+}
+
+/**
+ * Split index-aligned `tasks` (built from `targets.map(...)`) into the subset
+ * whose target resolved to `providerId` and everything else. Used to give one
+ * provider its own concurrency pool without touching every other provider's
+ * dispatch. Pure/sync — no I/O.
+ * @param {Array<object>} targets
+ * @param {Array<() => Promise<any>>} tasks
+ * @param {string} providerId
+ */
+export function partitionTasksByProvider(targets, tasks, providerId) {
+  const matched = [];
+  const rest = [];
+  tasks.forEach((task, i) => {
+    (targets[i]?._provider?.id === providerId ? matched : rest).push(task);
+  });
+  return { matched, rest };
+}
+
+/**
+ * Dispatch every provider task with the existing shared CONCURRENCY, except
+ * `apify` tasks (Apify's own account-level concurrent-actor-run cap), which
+ * get their own smaller pool. Both pools run concurrently with each other —
+ * they hit unrelated services, and every task already mutates shared
+ * outer-scope state (newOffers/errors) via closure rather than through this
+ * function's return value, so combining two pools instead of one changes
+ * nothing about dedupe, scan-history, or the pipeline write that follow.
+ * @param {Array<object>} targets
+ * @param {Array<() => Promise<any>>} tasks
+ * @param {{ apifyConcurrency?: number, concurrency?: number }} [opts]
+ */
+export async function dispatchScanTasks(targets, tasks, { apifyConcurrency = APIFY_CONCURRENCY, concurrency = CONCURRENCY } = {}) {
+  const { matched: apifyTasks, rest: otherTasks } = partitionTasksByProvider(targets, tasks, 'apify');
+  await Promise.all([
+    parallelFetch(apifyTasks, Math.min(apifyConcurrency, apifyTasks.length)),
+    parallelFetch(otherTasks, concurrency),
+  ]);
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -3434,7 +3478,7 @@ async function main() {
     }
   });
 
-  await parallelFetch(tasks, CONCURRENCY);
+  await dispatchScanTasks(targets, tasks);
 
   // 5.5. Optional liveness verification — drop expired and guard-rejected postings
   let verifiedOffers = newOffers;
