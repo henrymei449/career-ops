@@ -30,6 +30,7 @@ import { pathToFileURL } from 'url';
 import { resolveAndValidate } from './_net.mjs';
 import { readLock, writeLockEntry, diffPlugin, hashPluginTree, consentSurface } from './_lock.mjs';
 import { loadRegistry } from './_registry.mjs';
+import { getCareerOpsRoot } from '../path-resolver.mjs';
 
 /** The complete, closed set of hook kinds. Anything else (apply/submit/…) is rejected. */
 export const HOOK_KINDS = ['provider', 'ingest', 'search', 'notify', 'export'];
@@ -92,18 +93,20 @@ function isSafePluginPath(rootAbs, candidateAbs) {
 }
 
 /**
- * Resolve the config/plugins.yml path for a given project root.
- * @param {string} root
+ * Resolve the config/plugins.yml path. config/plugins.yml is a User Layer file
+ * (DATA_CONTRACT.md) — callers pass the resolved data root here, not the
+ * codebase root (#3512).
+ * @param {string} dataRoot
  */
-function pluginsConfigPath(root) {
-  return path.join(root, 'config', 'plugins.yml');
+function pluginsConfigPath(dataRoot) {
+  return path.join(dataRoot, 'config', 'plugins.yml');
 }
 
 /**
  * Read config/plugins.yml. Fail-open to {} if absent or malformed — exactly the
  * graceful posture scan.mjs uses for its own config. js-yaml is imported lazily
  * so this module stays side-effect-free at import time.
- * @param {string} root
+ * @param {string} dataRoot
  * @returns {Promise<object>}
  */
 export async function loadPluginConfig(root) {
@@ -594,8 +597,18 @@ export function lockGate(manifest, root) {
   }
 }
 
-export async function loadPlugins(kind, { root, dryRun = false, pluginId = null }) {
-  const cfg = await loadPluginConfig(root);
+/**
+ * @param {string} kind
+ * @param {{ root: string, dataRoot?: string, dryRun?: boolean, pluginId?: string }} opts
+ *   `root` locates plugin CODE (plugins/, plugins.local/, plugins.lock) — always
+ *   the codebase checkout. `dataRoot` locates plugin CONFIG (config/plugins.yml,
+ *   .env) — the resolved CAREER_OPS_DATA_DIR/CAREER_OPS_ROOT, which is a
+ *   different directory than `root` whenever a data root is configured (#3512).
+ *   Defaults to `root` so every existing single-root caller (tests included) is
+ *   unaffected.
+ */
+export async function loadPlugins(kind, { root, dataRoot = root, dryRun = false, pluginId = null }) {
+  const cfg = await loadPluginConfig(dataRoot);
   let manifests = discoverPlugins(pluginRoots(root), resolveSuccessorIds(root)).filter(m => m.hooks.includes(kind));
   if (pluginId) manifests = manifests.filter(m => m.id === pluginId);
   const out = [];
@@ -609,14 +622,20 @@ export async function loadPlugins(kind, { root, dryRun = false, pluginId = null 
   return out;
 }
 
-/** Lazily load dotenv exactly once (mirrors gemini-eval.mjs). Idempotent. */
+/**
+ * Lazily load dotenv exactly once (mirrors gemini-eval.mjs, doctor.mjs). Idempotent.
+ * Reads `.env` from the resolved data root (getCareerOpsRoot()) — same file
+ * doctor.mjs reads for ANTHROPIC_API_KEY etc. — not from process.cwd(), so a
+ * secret in DATA_ROOT/.env is found regardless of which directory the caller
+ * was invoked from (#3512).
+ */
 let dotenvLoaded = false;
 export async function loadDotenvOnce() {
   if (dotenvLoaded) return;
   dotenvLoaded = true;
   try {
     const { config } = await import('dotenv');
-    config();
+    config({ path: path.join(getCareerOpsRoot(), '.env'), quiet: true });
   } catch {
     // dotenv optional — fall back to ambient process.env (CI, exported vars).
   }
@@ -632,12 +651,12 @@ export async function loadDotenvOnce() {
  *
  * @param {string} kind
  * @param {*} payload   For provider this is unused; for ingest none; search a query; export a snapshot; notify a payload.
- * @param {{ root: string, dryRun?: boolean, timeoutMs?: number, pluginId?: string }} opts
+ * @param {{ root: string, dataRoot?: string, dryRun?: boolean, timeoutMs?: number, pluginId?: string }} opts
  * @returns {Promise<Array<{ id: string, ok: boolean, result?: any, error?: string }>>}
  */
-export async function runHook(kind, payload, { root, dryRun = false, timeoutMs = DEFAULT_HOOK_TIMEOUT_MS, pluginId = null }) {
+export async function runHook(kind, payload, { root, dataRoot = root, dryRun = false, timeoutMs = DEFAULT_HOOK_TIMEOUT_MS, pluginId = null }) {
   await loadDotenvOnce();
-  const loaded = await loadPlugins(kind, { root, dryRun, pluginId });
+  const loaded = await loadPlugins(kind, { root, dataRoot, dryRun, pluginId });
   const results = [];
   for (const { id, hook, ctx } of loaded) {
     const invoke = kind === 'search'
@@ -683,7 +702,9 @@ export function filterResultsForId(results, id) {
  *     the plugin off yields a helpful error, not a confusing "unknown provider".
  *
  * @param {Map<string, any>} providersMap   The Map returned by scan.mjs loadProviders.
- * @param {{ root: string }} opts
+ * @param {{ root: string, dataRoot?: string }} opts
+ *   `root` locates plugin CODE; `dataRoot` (defaults to `root`) locates
+ *   config/plugins.yml and .env — see loadPlugins' jsdoc (#3512).
  */
 // A detect-exempt provider whose fetch throws an actionable message — used when
 // a known provider plugin is inactive (disabled / missing key / failed import)
@@ -696,14 +717,14 @@ function inactiveProviderStub(id, reason) {
   };
 }
 
-export async function mergeProviderPlugins(providersMap, { root }) {
-  if (!existsSync(pluginsConfigPath(root))) return; // (1) opted out → inert (no work, no env read)
+export async function mergeProviderPlugins(providersMap, { root, dataRoot = root }) {
+  if (!existsSync(pluginsConfigPath(dataRoot))) return; // (1) opted out → inert (no work, no env read)
 
   // Everything past the opt-out gate is wrapped so an UNANTICIPATED throw
   // (a callee regression) degrades to a ⚠️ and leaves the core providers Map
   // untouched — fail-open is enforced structurally here, not just emergently.
   try {
-    const cfg = await loadPluginConfig(root);
+    const cfg = await loadPluginConfig(dataRoot);
     const providerManifests = discoverPlugins(pluginRoots(root), resolveSuccessorIds(root)).filter(m => m.hooks.includes('provider'));
     if (providerManifests.length === 0) return;
 

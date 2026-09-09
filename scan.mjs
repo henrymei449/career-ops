@@ -3012,7 +3012,10 @@ async function main() {
   // Opt-in: merge enabled keyed/auth-gated provider plugins. Returns immediately
   // (no discovery, no dotenv, no process.env mutation) when config/plugins.yml is
   // absent — so a plain scan with no plugins configured stays byte-identical.
-  await mergeProviderPlugins(providers, { root: path.dirname(PROVIDERS_DIR) });
+  // `root` locates plugin CODE (codebase checkout); `dataRoot` locates plugin
+  // CONFIG (config/plugins.yml, .env), which lives under CAREER_OPS_DATA_DIR
+  // whenever one is configured (#3512).
+  await mergeProviderPlugins(providers, { root: path.dirname(PROVIDERS_DIR), dataRoot: DATA_ROOT });
   if (providers.size === 0) {
     console.error('Error: no providers loaded from providers/');
     process.exit(1);

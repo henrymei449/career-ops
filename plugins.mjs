@@ -30,8 +30,15 @@ import { readLock, writeLockEntry, removeLockEntry, hashPluginTree, consentSurfa
 import { installFromRepo, scaffoldNew, parseRepoArg } from './plugin-install.mjs';
 import { appendToPipeline } from './scan.mjs';
 import { isMainModule } from './lib/is-main-module.mjs';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
+// config/plugins.yml is a User Layer file (DATA_CONTRACT.md) — it resolves
+// under CAREER_OPS_DATA_DIR/CAREER_OPS_ROOT like the rest of the user layer,
+// which is a different directory than ROOT whenever a data root is configured
+// (#3512). Plugin CODE (plugins/, plugins.local/, plugins.lock) stays keyed to
+// ROOT — only config/plugins.yml and .env move.
+const DATA_ROOT = getCareerOpsRoot();
 const APPLICATIONS_PATH = path.join(ROOT, 'data', 'applications.md');
 const PIPELINE_PATH = path.join(ROOT, 'data', 'pipeline.md');
 
@@ -94,7 +101,7 @@ function buildSnapshot() {
 }
 
 async function cmdList() {
-  const cfg = await loadPluginConfig(ROOT);
+  const cfg = await loadPluginConfig(DATA_ROOT);
   const overridden = resolveSuccessorIds(ROOT); // ids where an installed successor is active
   const manifests = discoverPlugins(pluginRoots(ROOT), overridden);
   if (manifests.length === 0) {
@@ -125,7 +132,7 @@ async function cmdRun(args) {
   const id = positional[0];
   if (!id) { console.error('Usage: node plugins.mjs run <id> [hook] [args…] [--dry-run]'); process.exit(1); }
 
-  const cfg = await loadPluginConfig(ROOT);
+  const cfg = await loadPluginConfig(DATA_ROOT);
   const manifest = discoverPlugins(pluginRoots(ROOT), resolveSuccessorIds(ROOT)).find(m => m.id === id);
   if (!manifest) { console.error(`Unknown plugin "${id}". Run \`node plugins.mjs list\`.`); process.exit(1); }
 
@@ -155,7 +162,7 @@ async function cmdRun(args) {
   if (hook === 'ingest' || hook === 'search') {
     const payload = hook === 'search' ? positional.slice(hookArgStart).join(' ') : undefined;
     if (hook === 'search' && !payload) { console.error(`search needs a query: node plugins.mjs run ${id} search "<query>"`); process.exit(1); }
-    const results = filterResultsForId(await runHook(hook, payload, { root: ROOT, dryRun, pluginId: id }), id);
+    const results = filterResultsForId(await runHook(hook, payload, { root: ROOT, dataRoot: DATA_ROOT, dryRun, pluginId: id }), id);
     const found = results.filter(r => r.ok && Array.isArray(r.result)).flatMap(r => r.result).map(sanitizeJob).filter(Boolean);
     // Additive de-dup: never re-add a URL already in the pipeline.
     const known = existingPipelineUrls();
@@ -179,7 +186,7 @@ async function cmdRun(args) {
     // reads as empty), so counting it here would silently do nothing anyway.
     const rowCount = snapshot.applications.length;
     const timeoutMs = Math.min(120_000, Math.max(15_000, rowCount * 3_000));
-    const results = filterResultsForId(await runHook('export', snapshot, { root: ROOT, dryRun, timeoutMs, pluginId: id }), id);
+    const results = filterResultsForId(await runHook('export', snapshot, { root: ROOT, dataRoot: DATA_ROOT, dryRun, timeoutMs, pluginId: id }), id);
     for (const r of results) {
       if (r.ok) console.log(`${r.id} export: pushed ${r.result?.pushed ?? 0} record(s).`);
       else console.log(`${r.id} export: failed — ${r.error}`);
@@ -189,7 +196,7 @@ async function cmdRun(args) {
 
   if (hook === 'notify') {
     const message = positional.slice(hookArgStart).join(' ') || '(career-ops notification)';
-    const results = filterResultsForId(await runHook('notify', { message }, { root: ROOT, dryRun, pluginId: id }), id);
+    const results = filterResultsForId(await runHook('notify', { message }, { root: ROOT, dataRoot: DATA_ROOT, dryRun, pluginId: id }), id);
     for (const r of results) console.log(r.ok ? `${r.id} notify: sent.` : `${r.id} notify: failed — ${r.error}`);
     return;
   }
@@ -255,14 +262,15 @@ export function parsePluginConfig(raw, file) {
 }
 
 // Write enabled:true/false into config/plugins.yml, merging (never clobbering
-// the user's other plugins or non-secret settings).
+// the user's other plugins or non-secret settings). config/plugins.yml is a
+// User Layer file — write target is DATA_ROOT, matching loadPluginConfig (#3512).
 function setEnabled(id, on, settings) {
-  const file = path.join(ROOT, 'config', 'plugins.yml');
+  const file = path.join(DATA_ROOT, 'config', 'plugins.yml');
   const cfg = parsePluginConfig(existsSync(file) ? readFileSync(file, 'utf8') : null, file);
   if (!cfg.plugins || typeof cfg.plugins !== 'object') cfg.plugins = {};
   const prev = (cfg.plugins[id] && typeof cfg.plugins[id] === 'object') ? cfg.plugins[id] : {};
   cfg.plugins[id] = { ...prev, ...(settings || {}), enabled: on };
-  mkdirSync(path.join(ROOT, 'config'), { recursive: true });
+  mkdirSync(path.join(DATA_ROOT, 'config'), { recursive: true });
   writeFileSync(file, '# career-ops plugin activation — see config/plugins.example.yml\n' + yaml.dump(cfg), 'utf8');
 }
 
