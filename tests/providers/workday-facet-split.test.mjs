@@ -61,7 +61,7 @@ const DSG_FACETS = [
 try {
   const workdayModule = await import(pathToFileURL(join(ROOT, 'providers/workday.mjs')).href);
   const workday = workdayModule.default;
-  const { trueTotalFromFacets, chooseSplitFacet } = workdayModule;
+  const { trueTotalFromFacets, chooseSplitFacet, SLICE_CONCURRENCY } = workdayModule;
 
   // ── trueTotalFromFacets ───────────────────────────────────────────
 
@@ -172,6 +172,7 @@ try {
 try {
   const workdayModule = await import(pathToFileURL(join(ROOT, 'providers/workday.mjs')).href);
   const workday = workdayModule.default;
+  const { SLICE_CONCURRENCY } = workdayModule;
 
   const ENTRY = { name: 'Acme', careers_url: 'https://acme.wd1.myworkdayjobs.com/acme' };
 
@@ -343,11 +344,19 @@ try {
     };
   }, { includeUndated: true })));
   // max_pages (100) * SPLIT_PAGE_BUDGET_FACTOR (5), plus the page-0 of the
-  // slice that discovers the budget is gone.
-  if (budgetCalls <= 501) {
+  // slice(s) that discover the budget is gone. Slices are processed by
+  // SLICE_CONCURRENCY workers pulling from a shared budget counter (perf,
+  // #PERF-2026-09-07): up to SLICE_CONCURRENCY of them can pass the
+  // `pagesSpent < pageBudget` gate together before any of their own
+  // `runQuery()` calls land and increment it, so the shared counter can run a
+  // bounded amount past 500 before every worker notices and stops — still
+  // strictly bounded (never unbounded/pathological), just with a
+  // concurrency-sized margin instead of exactly one extra call.
+  const budgetTolerance = 500 + 1 + SLICE_CONCURRENCY * 3;
+  if (budgetCalls <= budgetTolerance) {
     pass('workday.fetch() caps total pages per tenant so one pathological board cannot eat a sweep');
   } else {
-    fail(`clamped fan-out spent ${budgetCalls} requests, expected <= 501`);
+    fail(`clamped fan-out spent ${budgetCalls} requests, expected <= ${budgetTolerance}`);
   }
 
 

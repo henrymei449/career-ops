@@ -59,6 +59,18 @@ const MAX_SPLIT_DEPTH = 2;
 // values, each still clamped) must not turn one board into an unbounded crawl.
 const MAX_SPLIT_SLICES = 100;
 
+// How many facet slices may be in flight at once (perf, #PERF-2026-09-07).
+// Slices were previously walked fully serially — a large clamped tenant
+// (Applied Materials: 100 slices, Accenture: 96) paid every slice's request
+// latency plus INTER_PAGE_DELAY_MS one at a time, dominating full-sweep wall
+// time. Bounded rather than unbounded so this stays a modest multiplier on
+// request rate, not a burst: each slice still goes through the same
+// fetchJsonWithRetry/RETRY_POLICY backoff on 429/5xx, so a WAF response slows
+// that slice down without being hammered harder by the others.
+// Exported so the page-budget test (workday-facet-split.test.mjs) can express
+// its overshoot tolerance in terms of this constant instead of a magic number.
+export const SLICE_CONCURRENCY = 3;
+
 // Page budget for a whole tenant, as a multiple of max_pages. A clamped board
 // is crawled once unfaceted and then once per slice, and slices overlap, so the
 // page count is not bounded by the board size — this is what stops one
@@ -640,35 +652,59 @@ export default {
           if (trueTotal - chosenCoverage > spread) splitIncomplete = true;
         }
 
-        for (const value of facet.values) {
-          if (slicesSpent >= MAX_SPLIT_SLICES) { splitIncomplete = true; break; }
-          if (pagesSpent >= pageBudget) { splitIncomplete = true; break; }
-          slicesSpent++;
-          await sleep(INTER_PAGE_DELAY_MS, ctx);
-          const nextApplied = { ...applied, [facet.facetParameter]: [value.id] };
-          // runQuery()'s page-0 fetch is unguarded — fine for the one page-0 of
-          // an ordinary board, but here it runs once per slice against a tenant
-          // that is by definition large, which is where a WAF or rate limiter
-          // lives. Letting it throw would abandon the whole tenant including
-          // the unfaceted crawl already absorbed into `out`, so a dead slice
-          // becomes an incomplete split and the rest of the partition is still
-          // tried. Same accounting as a slice that died mid-pagination.
-          let sliceResult;
-          try {
-            sliceResult = await runQuery(nextApplied);
-          } catch (err) {
-            const attempts = err.attempts ?? RETRY_POLICY.retries + 1;
-            console.error(`⚠️  workday: ${entry.name} slice ${facet.facetParameter}=${value.id} failed on its first page after ${attempts} attempts: ${err.message}`);
-            splitIncomplete = true;
-            continue;
+        // Bounded-concurrency slice processing (perf, #PERF-2026-09-07): up to
+        // SLICE_CONCURRENCY workers pull from the same `cursor` into
+        // `facet.values`, so the budget checks and `slicesSpent++` below still
+        // run once per slice, in the same synchronous step (no `await`
+        // between the check and the increment) — safe under concurrency
+        // because nothing can interleave mid-step on Node's single thread.
+        // Once the shared budget is spent, every worker sees that on its next
+        // pull and stops; `splitIncomplete` may be set by more than one
+        // worker, which is harmless (idempotent). `absorb()` (called from
+        // `split()` on each slice's result) is also fully synchronous, so
+        // concurrent recursive calls can't race on `seen`/`out` either.
+        // Recursion (depth+1) runs OUTSIDE this pool, after a slice's own
+        // request completes — a nested split gets its own fresh pool for its
+        // own children rather than holding one of these SLICE_CONCURRENCY
+        // slots idle while it waits on grandchildren.
+        let cursor = 0;
+        const worker = async () => {
+          while (cursor < facet.values.length) {
+            const value = facet.values[cursor++];
+            if (slicesSpent >= MAX_SPLIT_SLICES) { splitIncomplete = true; return; }
+            if (pagesSpent >= pageBudget) { splitIncomplete = true; return; }
+            slicesSpent++;
+            await sleep(INTER_PAGE_DELAY_MS, ctx);
+            const nextApplied = { ...applied, [facet.facetParameter]: [value.id] };
+            // runQuery()'s page-0 fetch is unguarded — fine for the one page-0 of
+            // an ordinary board, but here it runs once per slice against a tenant
+            // that is by definition large, which is where a WAF or rate limiter
+            // lives. Letting it throw would abandon the whole tenant including
+            // the unfaceted crawl already absorbed into `out`, so a dead slice
+            // becomes an incomplete split and the rest of the partition is still
+            // tried. Same accounting as a slice that died mid-pagination.
+            let sliceResult;
+            try {
+              sliceResult = await runQuery(nextApplied);
+            } catch (err) {
+              const attempts = err.attempts ?? RETRY_POLICY.retries + 1;
+              console.error(`⚠️  workday: ${entry.name} slice ${facet.facetParameter}=${value.id} failed on its first page after ${attempts} attempts: ${err.message}`);
+              splitIncomplete = true;
+              continue;
+            }
+            await split(
+              sliceResult,
+              nextApplied,
+              depth + 1,
+              [...excluded, facet.facetParameter],
+            );
           }
-          await split(
-            sliceResult,
-            nextApplied,
-            depth + 1,
-            [...excluded, facet.facetParameter],
-          );
-        }
+        };
+        const workers = Array.from(
+          { length: Math.min(SLICE_CONCURRENCY, facet.values.length) },
+          () => worker(),
+        );
+        await Promise.all(workers);
       };
 
       await split(root, {}, 0, []);
@@ -679,6 +715,11 @@ export default {
       // recovered on top of the ceiling.
       const short = splitIncomplete || budgetExhausted ? ' (still incomplete)' : '';
       console.error(`⚠️  workday: ${entry.name} offset-clamped at ${WORKDAY_OFFSET_CEILING} — recovered ${jobs.length} jobs via ${slicesSpent} facet slices${short}`);
+      // Array-tag pattern (matches workdayNoDateSkip/workdayTruncated below) —
+      // read by scan.mjs's per-company timing line so a scan run can report
+      // "clamp triggered, N slices" without a telemetry framework.
+      jobs.workdayClamped = true;
+      jobs.workdaySliceCount = slicesSpent;
     }
 
     // The cap is a safety net, not a working limit — silent by design, but a
