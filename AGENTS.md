@@ -508,3 +508,20 @@ num\tdate\tcompany\trole\tstatus\tscore\tpdf\treport\tnotes\turl
 - No markdown bold (`**`) in status field
 - No dates in status field (use the date column)
 - No extra text (use the notes column)
+
+## CareerOps Claude Code Efficiency Rules
+
+1. Do not re-audit or re-read the entire repo unless the task genuinely requires it.
+2. Start with the smallest set of relevant files. Use grep/search first, then open only the files needed.
+3. Do not spawn subagents for simple, sequential, or single-file tasks.
+4. Prefer direct file reads/edits over broad exploratory tool use.
+5. Do not repeat context already persisted in repo files or git history.
+6. Keep progress narration terse. Report only:
+   - what changed
+   - what failed
+   - what needs my decision
+7. Work incrementally and preserve state in files/git rather than relying on long chat history.
+8. For completed tasks, recommend starting a fresh Claude Code session when continued context would mostly be stale.
+9. Do not run broad tests/scans unless needed; prefer the smallest relevant test first, then full regression only before commit or when warranted.
+10. Do not change unrelated architecture/config while solving a scoped task.
+11. Infer the task mode from the request: architecture/build, debugging, or discovery/operations. Stay within that mode unless a blocker requires crossing into another one, and ask before broadening scope.
