@@ -47,6 +47,8 @@ Read `spend_tier` from `config/profile.yml` (see `modes/_shared.md` -- Spend Tie
 | # | Company | Role | Score | PDF | Recommended action |
 ```
 
+5. **Export the shortlist.** Run `node export-shortlist.mjs` — it reads the just-updated `data/applications.md` (enriched from each row's linked report) and writes `exports/careerops-shortlist-{YYYY-MM-DD}.csv`, an A/B-verdict-only CSV ready to open in Excel/Sheets. Runs after every pipeline pass, not only when new offers were added, so a rerun always reflects the tracker's current state — it's a fast, deterministic, read-mostly step with no side effect on `pipeline.md`/`applications.md` themselves. If it reports 0 rows, say so plainly rather than treating it as an error (it means no A/B-verdict evaluated opportunities exist yet, not that the export failed).
+
 ## Format of pipeline.md
 
 ```markdown
