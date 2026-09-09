@@ -60,18 +60,27 @@ Table with:
 
 ### Geo-mismatch check
 
-After filling the Remote row, cross-check the posting's **structured location field** (the location/remote designation shown on the posting page or in ATS metadata — not the Remote row you just wrote) against the JD body:
+After filling the Remote row, cross-check the posting's **structured location field** (the location/remote designation shown on the posting page or in ATS metadata — not the Remote row you just wrote) against the JD body, in **both directions** — a mismatch is a mismatch regardless of which side looks more remote.
 
+**Direction 1 — structured field says remote, JD body adds a binding attendance requirement:**
 - **Contradiction** = the location field says remote, but the JD body states a **binding attendance requirement**: "hybrid", "X days per week/month" in office, "in-office", "onsite"/"on-site", mandatory office attendance, or a relocation requirement.
 - **Not a contradiction:** negations ("no onsite requirement"), optional or occasional in-person events ("quarterly offsites", "optional co-working space"), or generic benefits boilerplate.
+- On contradiction, add this flag line at the top of Block B, quoting the evidence **verbatim** (never paraphrase):
+
+  `⚠️ **Geo-mismatch:** location field says remote, but JD body says "{verbatim JD line}"`
+
+**Direction 2 — structured field is a bare/non-remote city or an explicit on-site/hybrid designation, JD body asserts materially greater remote flexibility:**
+- **Contradiction** = the location field is a plain city/state string (on-site by default absent other signal) or an explicit "On-site"/"Hybrid" designation, but the JD body asserts materially greater remote flexibility than that: "predominantly remote", "remote-first", "fully remote", "work from anywhere", or equivalent language — not merely an occasional/optional WFH allowance.
+- **Not a contradiction:** minor or optional flexibility ("occasional remote days", "flexible schedule"), or generic benefits boilerplate that doesn't actually describe where the work happens.
+- On contradiction, add this flag line at the top of Block B, quoting the evidence **verbatim**:
+
+  `⚠️ **Geo-mismatch:** location field says "{structured location/designation}", but JD body says "{verbatim JD line}"`
+
+**Common to both directions:**
 - If the JD body says nothing about location or attendance, emit no flag — silence is absence of signal, not agreement.
 - If the input has no structured location field (pasted JD text only), skip this check.
-
-On contradiction, add exactly one flag line at the top of Block B in the report, quoting the evidence **verbatim** (never paraphrase):
-
-`⚠️ **Geo-mismatch:** location field says remote, but JD body says "{verbatim JD line}"`
-
-The flag is an additive line only — Block B's existing content stays unchanged below it, and no flag line appears when there is no contradiction.
+- The flag is additive only — Block B's existing content stays unchanged below it, and no flag line appears when there is no contradiction in either direction.
+- **Do not resolve either direction's conflict optimistically here.** This check only surfaces the conflict — it never picks a side or assigns a tier itself. The actual classification comes from the candidate's own location policy in `modes/_profile.md`, if one is defined; a profile using a tiered location policy (like this one) should treat a Direction 2 conflict as its own "needs validation" outcome (e.g. Tier 3) rather than resolving toward the strongest-fit tier on JD text alone.
 
 ### Work-authorization check
 
