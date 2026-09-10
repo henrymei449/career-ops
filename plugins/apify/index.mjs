@@ -5,8 +5,9 @@
 // seeds take only security/compat fixes — feature work happens in the successor repo.
 //
 // Apify provider plugin — runs any Apify actor and maps its dataset items to
-// the {title, url, company, location} Job shape the scanner expects. All
-// variation (which actor, what input, how to read fields) lives in portals.yml.
+// the {title, url, company, location, postedAt?} Job shape the scanner
+// expects. All variation (which actor, what input, how to read fields) lives
+// in portals.yml.
 //
 // Ported from the generic Apify provider contributed by @ageem23 in #693 (with
 // thanks); it also homes the LinkedIn-via-Apify use case from #791/#1202. As a
@@ -24,13 +25,68 @@
 //         url:      url
 //         company:  [company, companyName]
 //         location: [location, formattedLocation]
+//         postedAt: postedAt                 # optional — see below
+//
+// ── postedAt / --since ───────────────────────────────────────────────────
+// `field_map.postedAt` is optional and, unlike title/url, does NOT default to
+// blocking the entry if absent — a Job with no postedAt is simply undated,
+// same "don't penalize missing data" convention scan.mjs already applies to
+// every other provider (buildPostingAgeFilter/buildPostedDateFilter in
+// scan.mjs treat a missing/non-numeric postedAt as "always passes"). When the
+// underlying actor's dataset DOES expose a posting-date field, map it here so
+// scan.mjs's existing central age/date filters — which is where `--since`,
+// `--posted-after`/`--posted-before`, and `max_posting_age_days` are actually
+// enforced — can do their job. Without this mapping, EVERY job from this
+// provider is silently treated as undated and sails through any `--since`
+// window regardless of true posting age (confirmed on the
+// curious_coder/linkedin-jobs-scraper LinkedIn actor: its dataset items carry
+// a `postedAt` field ("YYYY-MM-DD") per Apify's published input/output schema
+// for that actor, but nothing here ever read it before this fix).
+//
+// parsePostedAt() accepts a YYYY-MM-DD string, a full ISO timestamp, or a
+// numeric epoch already in ms or seconds. It returns `undefined` — never a
+// guessed value — for anything it can't parse.
+//
+// Deliberately NOT done here: forwarding `ctx.sinceMs` into the actor's own
+// input (e.g. curious_coder/linkedin-jobs-scraper's `datePosted` field) as a
+// native pre-filter. That field's accepted enum values are not fully
+// documented publicly beyond the confirmed default `"anyTime"` — shipping a
+// guessed value for the other buckets risks either the actor silently
+// ignoring it (no harm, no benefit) or Apify rejecting the run outright (a
+// full family failure) with no way to verify locally without spending Apify
+// credits on a live call. Correctness does not depend on this: the
+// post-fetch `postedAt` capture above plus scan.mjs's existing central filter
+// enforce the window regardless of what the actor itself pre-filters. Wiring
+// the native filter would only reduce wasted actor runs/cost; do it once
+// someone confirms the exact enum values against the live actor.
 
 import { mkdirSync, writeFileSync, existsSync } from 'fs';
 import { createHash } from 'crypto';
 import { join } from 'path';
 import { hasToken, runActor } from './_apify.mjs';
+import { getCareerOpsRoot } from '../../path-resolver.mjs';
 
-const JDS_DIR = 'jds';
+// This used to be the bare relative path 'jds', resolved against
+// process.cwd() by mkdirSync/join/writeFileSync below. That happens to match
+// DATA_ROOT when scan.mjs is run with the repo root as cwd AND the data root
+// IS the repo root (the common single-checkout case this was written
+// against) — but silently diverges the moment CAREER_OPS_ROOT/
+// CAREER_OPS_DATA_DIR points somewhere else (e.g. a synced Drive folder),
+// same as scan.mjs itself resolves PORTALS_PATH/SCAN_HISTORY_PATH/
+// PIPELINE_PATH. Reuse scan.mjs's own resolver rather than reimplementing
+// the CAREER_OPS_ROOT/CAREER_OPS_DATA_DIR/.career-ops-data precedence here a
+// second time — two independent implementations of the same lookup is how
+// they drift.
+//
+// JDS_REL is the relative form every consumer of `local:{path}` expects and
+// resolves against DATA_ROOT itself (scan.mjs's `local:` reader, outcome.mjs's
+// `local:(jds\/[^\s|)]+)` regex, jd-capture.mjs's report-number lookup,
+// pipeline.md entries). Only JDS_DIR (the absolute filesystem location this
+// module actually writes to) changes below — the STORED reference
+// stays the bare relative `jds/{filename}` string it always was, or every one
+// of those consumers breaks.
+export const JDS_REL = 'jds';
+export const JDS_DIR = join(getCareerOpsRoot(), JDS_REL);
 const MIN_JD_BODY_CHARS = 50;
 
 function getPath(obj, p) {
@@ -56,6 +112,31 @@ function pickField(item, spec) {
 }
 
 const ALLOWED_DEFAULT_KEYS = new Set(['title', 'url', 'company', 'location']);
+
+// Parse a raw postedAt-like value from an actor's dataset item into epoch ms.
+// Accepts:
+//   - a numeric epoch already in ms (>= 1e12 — no genuine posting date is
+//     ever earlier than roughly the year 2001 expressed in ms) or in seconds
+//     (a smaller finite number, converted to ms)
+//   - a numeric string ('1731020400' / '1731020400000') — same rule as above
+//   - a date/timestamp string parseable by Date.parse ('2026-08-20',
+//     '2026-08-20T14:03:00Z', etc.)
+// Returns `undefined` for null/empty/unparseable input — never a guessed or
+// fabricated date. Callers must treat `undefined` as "unknown," not "stale"
+// or "fresh" (see scan.mjs's buildPostingAgeFilter: a missing postedAt always
+// passes the age filter, it is never assumed to be within any window).
+export function parsePostedAt(value) {
+  if (value == null || value === '') return undefined;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return undefined;
+    return value < 1e12 ? value * 1000 : value;
+  }
+  const str = String(value).trim();
+  if (str === '') return undefined;
+  if (/^\d+$/.test(str)) return parsePostedAt(Number(str));
+  const ms = Date.parse(str);
+  return Number.isFinite(ms) ? ms : undefined;
+}
 
 // Actors return URLs from arbitrary external sites — treat them as untrusted.
 // Reject anything that isn't https so javascript:/data:/file:/http: URLs can't
@@ -119,7 +200,7 @@ export function htmlToText(s) {
 // keeps two distinct postings sharing a company+title from colliding. Atomic
 // (flag:'wx') against the 10-worker TOCTOU race; any FS failure returns null so
 // the caller falls back to the remote URL.
-function saveJd(normalized, descriptionBody, sourceLabel) {
+export function saveJd(normalized, descriptionBody, sourceLabel) {
   let relPath = null;
   try {
     mkdirSync(JDS_DIR, { recursive: true });
@@ -130,7 +211,7 @@ function saveJd(normalized, descriptionBody, sourceLabel) {
       .slice(0, 10);
     const filename = `${baseSlug}-${urlHash}.md`;
     const filepath = join(JDS_DIR, filename);
-    relPath = `${JDS_DIR}/${filename}`;
+    relPath = `${JDS_REL}/${filename}`;
     if (existsSync(filepath)) return relPath;
     const today = new Date().toISOString().slice(0, 10);
     const content = `---
@@ -162,6 +243,14 @@ export function normalizeItem(item, fieldMap, defaults) {
     company: fieldMap.company ? String(pickField(item, fieldMap.company) || '') : '',
     location: fieldMap.location ? String(pickField(item, fieldMap.location) || '') : '',
   };
+  // Optional — absent field_map.postedAt (or an unparseable raw value) leaves
+  // out.postedAt unset entirely, so scan.mjs's central age/date filters see
+  // it as "no date supplied" (their existing, shared "don't penalize missing
+  // data" behavior) rather than a fabricated 0/NaN that could read as ancient.
+  if (fieldMap.postedAt) {
+    const parsed = parsePostedAt(pickField(item, fieldMap.postedAt));
+    if (parsed !== undefined) out.postedAt = parsed;
+  }
   for (const [k, v] of Object.entries(defaults || {})) {
     if (!ALLOWED_DEFAULT_KEYS.has(k)) continue;
     if (!out[k]) out[k] = String(v);
@@ -190,11 +279,12 @@ export default {
         !isFieldSpec(entry.field_map.url) ||
         (entry.field_map.company != null && !isFieldSpec(entry.field_map.company)) ||
         (entry.field_map.location != null && !isFieldSpec(entry.field_map.location)) ||
-        (entry.field_map.description != null && !isFieldSpec(entry.field_map.description))
+        (entry.field_map.description != null && !isFieldSpec(entry.field_map.description)) ||
+        (entry.field_map.postedAt != null && !isFieldSpec(entry.field_map.postedAt))
       ) {
         throw new Error(
           `apify: entry ${entry.name} has invalid field_map. Each of title, url, company, ` +
-          `location, description must be a string or a non-empty array of strings. title and url are required.`
+          `location, description, postedAt must be a string or a non-empty array of strings. title and url are required.`
         );
       }
 
