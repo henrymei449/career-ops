@@ -3261,6 +3261,25 @@ async function main() {
     const ctx = {
       ...makeHttpCtx(),
       sinceMs: earlyStopSinceMs,
+      // The literal `--since N` day count, kept SEPARATE from sinceMs above.
+      // sinceMs is derived through resolveEffectiveAfter's calendar-date
+      // truncation (deliberately "marginally more permissive" for the
+      // pagination early-stop this was built for) and a --posted-after/
+      // max_posting_age_days merge — by the time a provider sees it, it no
+      // longer says "1 day," it says "some day-plus-however-far-into-today
+      // window." A provider that needs the user's actual requested day
+      // count for its OWN native freshness filter (not for the early-stop
+      // hint, and never for correctness — that's still postedAt/postingAge/
+      // postedDate filtering below) must not derive it from sinceMs, or it
+      // silently rounds up to the next bucket on every run except the one
+      // that happens to start at exact UTC midnight (confirmed: this is
+      // exactly how plugins/apify/index.mjs's LinkedIn datePosted mapping
+      // ended up sending "pastWeek" for a requested "past24Hours" window).
+      // null when --since wasn't passed (a bare --posted-after or
+      // max_posting_age_days bound has no equivalent day count and is
+      // intentionally not translated into one here — see the same file's
+      // header note on scope).
+      sinceDays,
       includeUndated: true,
       locationHints: config.location_filter,
     };
