@@ -47,18 +47,70 @@
 // numeric epoch already in ms or seconds. It returns `undefined` — never a
 // guessed value — for anything it can't parse.
 //
-// Deliberately NOT done here: forwarding `ctx.sinceMs` into the actor's own
-// input (e.g. curious_coder/linkedin-jobs-scraper's `datePosted` field) as a
-// native pre-filter. That field's accepted enum values are not fully
-// documented publicly beyond the confirmed default `"anyTime"` — shipping a
-// guessed value for the other buckets risks either the actor silently
-// ignoring it (no harm, no benefit) or Apify rejecting the run outright (a
-// full family failure) with no way to verify locally without spending Apify
-// credits on a live call. Correctness does not depend on this: the
-// post-fetch `postedAt` capture above plus scan.mjs's existing central filter
-// enforce the window regardless of what the actor itself pre-filters. Wiring
-// the native filter would only reduce wasted actor runs/cost; do it once
-// someone confirms the exact enum values against the live actor.
+// ── ctx.sinceMs → actor-native datePosted (recall fix, defense-in-depth) ───
+// The postedAt post-fetch guard above fixes CORRECTNESS (a stale job can no
+// longer pass --since), but not RECALL: the actor was still being called
+// with its default (unfiltered) window, so `limitPerSource` was spent on
+// however many stale results came back first — a genuinely fresh posting
+// past that limit could go unfetched even though it would have passed the
+// post-fetch filter. Confirmed 2026-09-10 via a zero-cost Apify input-schema
+// validation probe (a deliberately-invalid `datePosted` value returns the
+// full accepted enum in the 400 error body, with no actor run ever started —
+// no dataset-result cost incurred) that
+// curious_coder/linkedin-jobs-scraper's `datePosted` accepts exactly:
+//   "anyTime" | "past24Hours" | "pastWeek" | "pastMonth"
+// mapSinceMsToDatePosted() below maps `ctx.sinceMs` to the SMALLEST bucket
+// that still covers the requested window — i.e. it only ever widens relative
+// to the exact bound, never narrows it, so it can over-fetch (mild recall
+// cost, same as any bucketed filter) but never risks excluding an eligible
+// fresh posting the post-fetch filter would have kept. Scoped to this ONE
+// verified actor by exact match (LINKEDIN_JOBS_SCRAPER_ACTOR below) — a
+// different `provider: apify` entry's actor has an unverified date-filter
+// field name and enum, and must not have one guessed onto it. Never applied
+// when the portals.yml entry already sets its own `input.datePosted`
+// (explicit user config wins), and a no-`--since` scan leaves `input`
+// untouched (actor keeps its own default, "anyTime" — unchanged behavior).
+// This is purely a cost/recall optimization layered in FRONT of the
+// unchanged postedAt post-fetch filter, which remains the actual correctness
+// guarantee — see the header note above.
+const LINKEDIN_JOBS_SCRAPER_ACTOR = 'curious_coder/linkedin-jobs-scraper';
+const DATE_POSTED_BUCKETS = [
+  { maxDays: 1, value: 'past24Hours' },
+  { maxDays: 7, value: 'pastWeek' },
+  { maxDays: 30, value: 'pastMonth' },
+];
+
+/**
+ * Map scan.mjs's ctx.sinceMs (the epoch-ms floor a job's postedAt must clear)
+ * to the smallest curious_coder/linkedin-jobs-scraper `datePosted` bucket
+ * that still covers it. Returns undefined when sinceMs isn't a usable
+ * number (no --since/--posted-after/max_posting_age_days bound in effect) —
+ * callers must leave `input.datePosted` unset in that case, not default it.
+ */
+export function mapSinceMsToDatePosted(sinceMs, now = Date.now()) {
+  if (typeof sinceMs !== 'number' || !Number.isFinite(sinceMs)) return undefined;
+  const ageDays = (now - sinceMs) / 86_400_000;
+  if (ageDays <= 0) return 'past24Hours'; // a bound at/after "now" is at least as tight as 24h
+  for (const bucket of DATE_POSTED_BUCKETS) {
+    if (ageDays <= bucket.maxDays) return bucket.value;
+  }
+  return 'anyTime';
+}
+
+/**
+ * The actual `input` object fetch() hands to runActor() — entry.input plus,
+ * only for the one verified actor and only when the entry doesn't already
+ * set its own datePosted, the ctx.sinceMs-derived bucket. Exported and
+ * side-effect-free (never mutates entry.input) specifically so this mapping
+ * is testable without touching the network — see
+ * tests/apify-linkedin-date-posted.test.mjs.
+ */
+export function resolveActorInput(entry, ctx) {
+  const input = entry.input || {};
+  if (entry.actor !== LINKEDIN_JOBS_SCRAPER_ACTOR || input.datePosted != null) return input;
+  const datePosted = mapSinceMsToDatePosted(ctx?.sinceMs);
+  return datePosted ? { ...input, datePosted } : input;
+}
 
 import { mkdirSync, writeFileSync, existsSync } from 'fs';
 import { createHash } from 'crypto';
@@ -290,7 +342,8 @@ export default {
 
       const opts = { token };
       if (entry.timeout_ms != null) opts.timeoutMs = entry.timeout_ms;
-      const items = await runActor(entry.actor, entry.input || {}, opts);
+
+      const items = await runActor(entry.actor, resolveActorInput(entry, ctx), opts);
 
       const useLocalJd = entry.field_map.description != null;
       const sourceLabel = String(entry.actor || 'apify').replace(/[^a-z0-9]+/gi, '-').toLowerCase();
