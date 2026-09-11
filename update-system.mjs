@@ -285,6 +285,7 @@ const SYSTEM_PATHS = [
   'scan.mjs',
   'append-pipeline-entry.mjs',
   'discovery-report.mjs',
+  'discard-suppression.mjs',
   'pipeline-lock.mjs',
   'portal-health-lock.mjs',
   'classify-tier.mjs',

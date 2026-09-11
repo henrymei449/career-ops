@@ -75,6 +75,7 @@ import { localToday } from './lib/local-today.mjs';
 import { printScanSummaryHeader } from './lib/scan-summary-marker.mjs';
 import { isMainModule } from './lib/is-main-module.mjs';
 import { promoteKnownFragmentIdentity } from './url-key.mjs';
+import { buildSuppressionIndexFromText } from './discard-suppression.mjs';
 
 try {
   const { config } = await import('dotenv');
@@ -3169,6 +3170,25 @@ async function main() {
   // 3.5. Load the user's do-not-apply list (#1742). Opt-in: absent file =
   // empty Map = the filter below never fires.
   const blacklist = loadBlacklist();
+
+  // 3.5b. Merge in explicit company-wide skips from data/discard.log. Opt-in
+  // the same way blacklist.md is: a discard.log entry only reaches this set
+  // when its reason carries the literal `(SKIP_COMPANY)` marker (see
+  // discard-suppression.mjs's header). The much more common free-text
+  // "(skip Company)" phrasing already in this log never matches that marker,
+  // so it stays what it always was -- a per-URL history note, not a policy --
+  // with no migration of the log needed. blacklist.md entries win on a key
+  // collision (first-set-wins below), since that file is the user's dedicated,
+  // deliberate do-not-apply list.
+  const discardLogText = readIfExists(path.join(DATA_ROOT, 'data/discard.log'));
+  if (discardLogText) {
+    const { companyIndex } = buildSuppressionIndexFromText(discardLogText);
+    for (const [key, { company, reason }] of companyIndex) {
+      if (!blacklist.has(key)) {
+        blacklist.set(key, { company, since: '', scope: 'company-wide (discard.log SKIP_COMPANY)', reason });
+      }
+    }
+  }
 
   // 4. Load dedup sets — one read per source file for the whole run (#2382).
   const historyPolicy = scanHistoryPolicy(config);
