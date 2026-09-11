@@ -1042,6 +1042,8 @@ These have no `npm run` binding — modes and agents call them with
 | `node reply-watch.mjs` | Classify employer replies from `data/reply-candidates.json`, match to tracker rows, print a review digest |
 | `node process-quality.mjs [--summary]` | Aggregate `[process-friction]` tags from `data/active-interviews.md` per company |
 | `node reserve-report-num.mjs [--count N]` | Atomically reserve report numbers for parallel workers (fixes the #749 race) |
+| `node append-pipeline-entry.mjs --payload <file.json>\|- [--json]` (or pipe JSON via stdin) | Locked-append CLI for job offers discovered outside scan.mjs's own provider loop (e.g. an agent's Playwright/WebSearch handoff for a company with no configured provider) — writes through scan.mjs's own `appendToPipeline()`/`appendToScanHistory()` lock and dedup snapshot instead of hand-editing `data/pipeline.md`/`data/scan-history.tsv`; stdin input lets a caller with Bash but no Write tool use it |
+| `node discovery-report.mjs --payload <run.json> [--out <path>] [--json]` | Renders the human review Markdown report for a scheduled discovery run (LinkedIn or Top-100) from `data/scan-runs.tsv` counters + `data/scan-history.tsv` candidate detail, classified via `location-tier.mjs`, to `reports/discovery/{date}_{kind}.md` |
 | `node agent-inbox.mjs add "..."` | Append a request to the queue the agent drains at the next session start |
 | `node generate-latex.mjs <input.tex> [output.pdf]` | Validate and compile a generated `.tex` CV via tectonic or pdflatex |
 | `node classify-tier.mjs` | Classify a job title into intern / entry / mid / senior |

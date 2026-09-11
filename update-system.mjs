@@ -283,9 +283,12 @@ const SYSTEM_PATHS = [
 
   'reserve-report-num.mjs',
   'scan.mjs',
+  'append-pipeline-entry.mjs',
+  'discovery-report.mjs',
   'pipeline-lock.mjs',
   'portal-health-lock.mjs',
   'classify-tier.mjs',
+  'location-tier.mjs',
   'scan-ats-full.mjs',
   'scan-interamt.mjs',
   'company-funded.mjs',
