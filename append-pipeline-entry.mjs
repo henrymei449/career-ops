@@ -39,7 +39,18 @@
  *     "description": "...",       // optional; feeds the cross-listing
  *                                  // fingerprint the same way a provider's
  *                                  // JD body does
- *     "note": "..."                // optional
+ *     "discoveryLane": "...",     // optional; one of keyword|semantic_recall|
+ *                                  // manual|external_handoff|unknown.
+ *                                  // Omitted -> "unknown", NEVER "keyword" --
+ *                                  // this CLI is used by paths that bypass
+ *                                  // keyword discovery entirely (e.g. the
+ *                                  // Top-100 handoff is "external_handoff").
+ *                                  // Threaded into the pipeline.md note as
+ *                                  // discovery_lane={value} for the
+ *                                  // evaluating agent to copy into the
+ *                                  // report's Machine Summary.
+ *     "note": "..."                // optional; preserved alongside the
+ *                                  // discovery_lane tag, not overwritten
  *   }
  *
  * Prints a JSON receipt (careerops.append.receipt@1) to stdout: added count,
@@ -69,9 +80,11 @@ const USAGE = `Usage:
                      for a caller with Bash but no Write tool.
   --json             emit the receipt as a single compact JSON line
 
-Each offer: { url, title, company, location?, source?, postedAt?, description?, note? }
+Each offer: { url, title, company, location?, source?, postedAt?, description?, discoveryLane?, note? }
 url must start with "http://", "https://", or "local:".
 postedAt (if given) must be an ISO date "YYYY-MM-DD".
+discoveryLane (if given) must be one of: keyword|semantic_recall|manual|external_handoff|unknown.
+Omitted -> "unknown", never "keyword".
 
 Writes through scan.mjs's locked appendToPipeline()/appendToScanHistory() —
 never hand-edits data/pipeline.md or data/scan-history.tsv directly — and
@@ -79,6 +92,14 @@ skips any URL already present in scan-history.tsv, pipeline.md, or
 applications.md (the same dedup snapshot scan.mjs itself uses).`;
 
 const URL_RE = /^(https?:\/\/|local:)/i;
+
+// Explicit discovery-provenance enum. A caller that omits discoveryLane gets
+// 'unknown' here, NEVER 'keyword' — this CLI is used by paths that
+// deliberately bypass keyword discovery entirely (the Top-100 headless
+// WebSearch/browser-extract handoff is 'external_handoff'), and silently
+// defaulting an unlabeled offer to 'keyword' would misattribute it for any
+// later keyword-vs-semantic_recall conversion analysis.
+export const DISCOVERY_LANES = ['keyword', 'semantic_recall', 'manual', 'external_handoff', 'unknown'];
 
 // PowerShell's `-Encoding utf8` (PS 5.1) writes a UTF-8 byte-order mark,
 // which JSON.parse rejects outright — strip it defensively since this CLI's
@@ -100,11 +121,22 @@ export function normalizeOfferInput(raw) {
   if (!title) return { ok: false, reason: 'missing title' };
   if (!company) return { ok: false, reason: 'missing company' };
 
+  if (raw.discoveryLane != null && !DISCOVERY_LANES.includes(raw.discoveryLane)) {
+    return { ok: false, reason: `discoveryLane must be one of ${DISCOVERY_LANES.join('|')}, got ${JSON.stringify(raw.discoveryLane)}` };
+  }
+  const discoveryLane = raw.discoveryLane ?? 'unknown';
+
   const offer = { url, title, company };
   if (typeof raw.location === 'string') offer.location = raw.location;
   if (typeof raw.source === 'string' && raw.source.trim()) offer.source = raw.source.trim();
-  if (typeof raw.note === 'string' && raw.note.trim()) offer.note = raw.note.trim();
   if (typeof raw.description === 'string' && raw.description.trim()) offer.description = raw.description;
+  // Provenance rides the same note: segment scan.mjs's own Lane A tagging
+  // uses — one transport, human-readable and machine-parseable at once. A
+  // caller-supplied note is preserved alongside it, never overwritten.
+  const provenanceLabel = `discovery_lane=${discoveryLane}`;
+  offer.note = typeof raw.note === 'string' && raw.note.trim()
+    ? `${raw.note.trim()} — ${provenanceLabel}`
+    : provenanceLabel;
 
   if (raw.postedAt != null) {
     const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(raw.postedAt).trim());

@@ -76,6 +76,8 @@ import { printScanSummaryHeader } from './lib/scan-summary-marker.mjs';
 import { isMainModule } from './lib/is-main-module.mjs';
 import { promoteKnownFragmentIdentity } from './url-key.mjs';
 import { buildSuppressionIndexFromText } from './discard-suppression.mjs';
+import { runStructuralChecks } from './post-title-gate.mjs';
+import { appendRecallCandidateIfNew } from './recall-store.mjs';
 
 try {
   const { config } = await import('dotenv');
@@ -2938,6 +2940,7 @@ const KNOWN_FLAGS = [
   '--dry-run', '--verify', '--headed-fallback', '--throttle', '--rediscover-404',
   '--include-blacklisted', '--company', '--posted-after', '--posted-before',
   '--since', '--quiet', '--json', '--help', '-h', '--timing',
+  '--capture-recall-rejects',
 ];
 
 // Flags whose space-separated value is the NEXT argv token (the `--flag=value`
@@ -2991,6 +2994,12 @@ async function main() {
   // --include-blacklisted: bypass the data/blacklist.md filter for auditing.
   // Matching postings flow through annotated instead of being counted out.
   const includeBlacklisted = args.includes('--include-blacklisted');
+  // Lane B (semantic-recall) capture — opt-in, default off. Existing
+  // behavior (Lane A) is unaffected either way; this only adds a side
+  // channel that writes title-filter rejects surviving no-fetch eligibility
+  // into data/recall-candidates.jsonl for a later, separate, capped
+  // recall-relevance.mjs pass. See post-title-gate.mjs / recall-store.mjs.
+  const captureRecallRejects = args.includes('--capture-recall-rejects');
   // flagValue reads both `--flag value` and `--flag=value`; a bare indexOf misses
   // the second form entirely and silently falls back to the unfiltered default.
   //
@@ -3365,8 +3374,35 @@ async function main() {
 
         if (!titleFilter(job.title)) {
           totalFilteredTitle++;
+          if (captureRecallRejects && !dryRun) {
+            // No-fetch eligibility only (tier/location/posting-age/posted-date/
+            // salary) — every one operates on fields already on `job`, zero
+            // extra fetch. A reject here never enters the Lane B holding pen;
+            // this keeps the recall pool free of postings that would fail on
+            // geography/staleness/comp regardless of title relevance.
+            const eligibility = runStructuralChecks(job, { skipTiers, locationFilter, postingAgeFilter, postedDateFilter, salaryFilter });
+            if (eligibility.accepted) {
+              await appendRecallCandidateIfNew({
+                url: job.url,
+                title: job.title,
+                company: job.company || company.name,
+                location: job.location,
+                postedAt: postedAtIsoDate(job.postedAt) || null,
+                source: company.name,
+                description: typeof job.description === 'string' ? job.description : null,
+              });
+            }
+          }
           continue;
         }
+        // Explicit provenance (never inferred from absence downstream — see
+        // discovery-lane enum in append-pipeline-entry.mjs / Machine Summary
+        // docs): every Lane A row is tagged here, unconditionally, so an
+        // evaluating agent never has to guess. Appended to any existing note
+        // (e.g. the blacklist annotation above) rather than overwriting it.
+        job.note = typeof job.note === 'string' && job.note.trim()
+          ? `${job.note} — discovery_lane=keyword`
+          : 'discovery_lane=keyword';
         if (classifyTier && skipTiers.includes(classifyTier(job.title))) {
           totalFilteredTier++;
           continue;

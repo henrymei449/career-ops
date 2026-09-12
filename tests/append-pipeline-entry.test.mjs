@@ -17,7 +17,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ROOT, NODE, rmSync } from './helpers.mjs';
-import { normalizeOfferInput, stripBom } from '../append-pipeline-entry.mjs';
+import { normalizeOfferInput, stripBom, DISCOVERY_LANES } from '../append-pipeline-entry.mjs';
 
 const CLI = join(ROOT, 'append-pipeline-entry.mjs');
 
@@ -98,6 +98,27 @@ test('CLI accepts a payload file with a leading BOM (as PowerShell Set-Content -
   } finally {
     rmSync(dataRoot, { recursive: true, force: true });
   }
+});
+
+test('normalizeOfferInput: omitted discoveryLane resolves to "unknown", never "keyword"', () => {
+  const result = normalizeOfferInput(SAMPLE_OFFER);
+  assert.equal(result.ok, true);
+  assert.equal(result.offer.note, 'found via handoff — discovery_lane=unknown');
+});
+
+test('normalizeOfferInput: an explicit discoveryLane is threaded into the note, preserving a caller-supplied note', () => {
+  const result = normalizeOfferInput({ ...SAMPLE_OFFER, discoveryLane: 'external_handoff' });
+  assert.equal(result.ok, true);
+  assert.equal(result.offer.note, 'found via handoff — discovery_lane=external_handoff');
+});
+
+test('normalizeOfferInput: rejects an invalid discoveryLane rather than guessing', () => {
+  const result = normalizeOfferInput({ ...SAMPLE_OFFER, discoveryLane: 'vibes' });
+  assert.equal(result.ok, false);
+});
+
+test('DISCOVERY_LANES: exactly the five required values', () => {
+  assert.deepEqual(DISCOVERY_LANES, ['keyword', 'semantic_recall', 'manual', 'external_handoff', 'unknown']);
 });
 
 test('CLI writes a new offer to pipeline.md and scan-history.tsv through the lock', () => {

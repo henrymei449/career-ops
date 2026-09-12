@@ -346,6 +346,7 @@ via: {agency/recruiter firm as a quoted string, or null for direct applications}
 company_confidential: {true when the end employer is unknown (company is "?"), else false}
 advertised_comp: {verbatim JD salary/range as a quoted string (e.g. "80-90k EUR"), or null when the JD states nothing}
 reports_to: {the JD's stated reporting line as a quoted string (e.g. "VP of Marketing"), or null when the JD names none}
+discovery_lane: "{keyword | semantic_recall | manual | external_handoff | unknown}"
 requirement_importance:
   - requirement: "{JD requirement}"
     jd_signal: "{verbatim JD quote for stated; structure reference for structural; null for inferred}"
@@ -369,6 +370,10 @@ Rules:
 - `reports_to` is the reporting line the JD itself states, in the JD's own wording; `null` when the JD names none — never infer it from the title, the team size, or company research. It records the seat's altitude, which the title alone does not: an IC seat reporting to a Head of Marketing and one reporting to the CEO are different roles.
 - Do not invent missing data. If confidence is limited, set `confidence: "Low"` and explain the limitation in the human-readable sections.
 - `work_auth` reflects the Block A work-authorization tier: `no_sponsorship` only when the JD **explicitly** refuses sponsorship for a role outside the candidate's `authorized_in`; `unstated` when the JD is silent (neutral, not a blocker); `not_needed` when the role is within `authorized_in` or sponsorship isn't required; `sponsors` when the JD explicitly offers it.
+- `discovery_lane` records HOW this posting was found, for downstream keyword-vs-recall conversion analysis — never inferred from absence, always set explicitly:
+  - The pipeline row this evaluation came from carries an optional `| note: ...` segment. If that note contains `discovery_lane=X`, use X verbatim (X is one of the five enum values).
+  - If the row was evaluated via the single-URL/direct-paste entry point (no scan/pipeline discovery at all — the user supplied the URL or JD directly), use `manual`.
+  - If neither applies — a pipeline row with no such note, e.g. a report written before this field existed, or a discovery path that hasn't been updated to tag itself — use `unknown`. **Never default to `keyword`** just because no other value is evident; `keyword` is asserted only when the note explicitly says so.
 - `requirement_importance` mirrors Block B's table row by row — same rows, same verdicts, snake_cased. `evidence: stated` **requires** a non-null verbatim `jd_signal`; `jd_signal: null` is legal only for `structural` and `inferred`. `importance` is never `critical` or `high` when `evidence: inferred` — that is Block B's gate, machine-checkable here. `match` is `strong | partial | missing | na`, mirroring ✅ / ⚠️ / ❌ / ➖. Use `[]` when the JD yields no usable requirement list. No consumer reads this key yet; it is allowlisted so it round-trips.
 - `risk_summary` mirrors the `## Risk Summary` block row by row — same source verdicts, snake_cased: `legitimacy` from the Block G tier (`high_confidence` / `proceed_with_caution` / `suspicious`), `culture` from the Block A Culture screen (`pass` / `caution` / `fail`), `interview_redflags` from the red-flag file's warning level (`none` / `caution` / `warning`), `ai_screening_disclosure` from the Block G AI-screening disclosure signal (`disclosed` when the posting names AI/automated screening, `corroborating_only` when the jurisdiction requires disclosure and the posting is silent, `no_match` when the candidate's jurisdiction has no table row). Any row rendered `— not evaluated` (or `— no interview sessions yet`) is `not_evaluated` here. Never invent a value the block does not show.
 
@@ -424,6 +429,7 @@ via: {agency/recruiter firm as a quoted string, or null for direct applications}
 company_confidential: {true when the end employer is unknown (company is "?"), else false}
 advertised_comp: {verbatim JD salary/range as a quoted string (e.g. "80-90k EUR"), or null when the JD states nothing}
 reports_to: {the JD's stated reporting line as a quoted string (e.g. "VP of Marketing"), or null when the JD names none}
+discovery_lane: "{keyword | semantic_recall | manual | external_handoff | unknown}"
 requirement_importance:
   - requirement: "{JD requirement}"
     jd_signal: "{verbatim JD quote for stated; structure reference for structural; null for inferred}"
