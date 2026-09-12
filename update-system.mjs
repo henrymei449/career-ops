@@ -289,6 +289,7 @@ const SYSTEM_PATHS = [
   'post-title-gate.mjs',
   'recall-store.mjs',
   'recall-relevance.mjs',
+  'cli-exec.mjs',
   'pipeline-lock.mjs',
   'portal-health-lock.mjs',
   'classify-tier.mjs',

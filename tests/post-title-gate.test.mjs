@@ -4,7 +4,10 @@
 // country/visa/dedup, never two that can drift.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runStructuralChecks, runContentChecks, runDedupChecks, runPostTitleGate } from '../post-title-gate.mjs';
+import {
+  runStructuralChecks, runContentChecks, runDedupChecks, runPostTitleGate,
+  isRecallGeographyEligible, runRecallEligibilityChecks,
+} from '../post-title-gate.mjs';
 
 const BASE_JOB = { title: 'Solutions Engineer', company: 'Acme', location: 'New York, NY', url: 'https://example.com/job/1' };
 
@@ -91,6 +94,63 @@ test('runPostTitleGate: composes all three stages in order — a structural reje
   );
   assert.equal(gateResult.reason, 'salary');
   assert.equal(dedupCalled, false);
+});
+
+// ── Recall-only geography gate — Lane A never calls this ────────────────
+// The three real captures that originally slipped through, now caught after
+// location-tier.mjs's KNOWN_NON_US_CITIES fix (Phase 3). Deliberately a
+// SEPARATE function from runPostTitleGate — Lane A's own chain must never
+// see this extra check.
+
+test('isRecallGeographyEligible: rejects "Toronto, ON, CAN" (real Autodesk capture — province/country abbreviations)', () => {
+  assert.equal(isRecallGeographyEligible({ title: 'Senior Product Manager', location: 'Toronto, ON, CAN' }), false);
+});
+
+test('isRecallGeographyEligible: rejects "Brisbane, Australia" (real AVEVA capture)', () => {
+  assert.equal(isRecallGeographyEligible({ title: 'Lead Development Representative', location: 'Brisbane, Australia' }), false);
+});
+
+test('isRecallGeographyEligible: rejects bare "NOIDA" (real Cadence capture — no country/state token at all)', () => {
+  assert.equal(isRecallGeographyEligible({ title: 'Product Engineering Architect', location: 'NOIDA' }), false);
+});
+
+test('isRecallGeographyEligible: does NOT over-tighten ambiguous US-possible locations', () => {
+  assert.equal(isRecallGeographyEligible({ title: 'Solutions Engineer', location: 'New York, NY' }), true);
+  assert.equal(isRecallGeographyEligible({ title: 'Solutions Engineer', location: 'Remote - United States' }), true);
+  assert.equal(isRecallGeographyEligible({ title: 'Solutions Engineer', location: 'Remote' }), true, 'bare Remote is ambiguous (needs-validation), not excluded — recall still wants a shot at it');
+  assert.equal(isRecallGeographyEligible({ title: 'Solutions Engineer', location: '3 Locations' }), true, 'a vague display string is ambiguous, not a confirmed non-US signal');
+});
+
+test('runRecallEligibilityChecks: composes structural checks with the geography gate — structural reject still wins first', () => {
+  const result = runRecallEligibilityChecks(
+    { title: 'Solutions Engineer', location: 'Toronto, ON, CAN', salary: 10 },
+    { salaryFilter: () => false },
+  );
+  assert.equal(result.accepted, false);
+  assert.equal(result.reason, 'salary', 'a structural reject must be reported on its own terms, not masked by the geography reason');
+});
+
+test('runRecallEligibilityChecks: geography-only reject reports reason "non_us_geography"', () => {
+  const result = runRecallEligibilityChecks({ title: 'Solutions Engineer', location: 'Brisbane, Australia' }, {});
+  assert.equal(result.accepted, false);
+  assert.equal(result.reason, 'non_us_geography');
+});
+
+test('runRecallEligibilityChecks: a structurally clean, US-plausible candidate is accepted', () => {
+  const result = runRecallEligibilityChecks({ title: 'Solutions Engineer', location: 'New York, NY' }, {});
+  assert.equal(result.accepted, true);
+});
+
+test('runPostTitleGate (Lane A\'s shared function) does NOT apply the geography gate — proves Lane A is untouched', () => {
+  // The same Toronto candidate that isRecallGeographyEligible rejects must
+  // still be ACCEPTED by the function Lane A actually calls, when no
+  // location_filter is configured — Lane A's policy is unchanged.
+  const result = runPostTitleGate(
+    { title: 'Solutions Engineer', company: 'Acme', location: 'Toronto, ON, CAN', url: 'https://example.com/1' },
+    {},
+    { seenUrls: new Set(), seenCompanyRoles: new Set(), canonicalizeCompany: (c) => c.toLowerCase() },
+  );
+  assert.equal(result.accepted, true, 'Lane A must remain unaffected by the recall-only geography gate');
 });
 
 test('runPostTitleGate: a fully clean candidate is accepted', () => {

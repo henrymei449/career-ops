@@ -32,7 +32,15 @@ const NON_US_COUNTRY_RE = /\bitaly\b|\bcanada\b|\bontario\b|\bquebec\b|\baustral
 
 // Bare city names (no state/country label in the source string) known from
 // this dataset to be outside the US.
-const KNOWN_NON_US_CITIES = ['warsaw', 'cluj napoca', 'bucharest', 'bengaluru', 'hsinchu', 'tokyo', 'riyadh', 'montevideo', 'bogota', 'ottawa'];
+const KNOWN_NON_US_CITIES = [
+  'warsaw', 'cluj napoca', 'bucharest', 'bengaluru', 'hsinchu', 'tokyo', 'riyadh', 'montevideo', 'bogota', 'ottawa',
+  // Added from real reverse-ATS captures classifying as Tier 3 (needs
+  // validation) instead of Tier 1 (excluded) -- confirmed via a real
+  // semantic-recall sample: "NOIDA" (Cadence) and "Toronto, ON, CAN"
+  // (Autodesk, where "ON"/"CAN" abbreviations don't match the full-word
+  // country regex) both slipped past the classifier undetected.
+  'toronto', 'noida', 'zhubei', 'belo horizonte',
+];
 
 // Bare city names known to be US, with no state/country token in the source
 // string — needed so a plain "SAN JOSE" / "Kalamazoo" resolves without a

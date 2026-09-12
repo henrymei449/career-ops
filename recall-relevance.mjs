@@ -34,8 +34,8 @@
  *   node recall-relevance.mjs --json                   # machine-readable summary
  *   node recall-relevance.mjs --self-test
  */
-import { execFileSync } from 'child_process';
 import { existsSync, readFileSync, appendFileSync, mkdirSync } from 'fs';
+import { execCliSafely } from './cli-exec.mjs';
 import { dirname, join } from 'path';
 import * as yaml from 'js-yaml';
 import { getCareerOpsRoot } from './path-resolver.mjs';
@@ -98,15 +98,75 @@ function clampCap(raw, fallback, ceiling) {
  * @param {object[]} batch
  * @returns {string}
  */
+// Truncated, not omitted: a provider-supplied description is real evidence
+// this pass should use (per explicit policy — never fetch a NEW JD for this
+// cheap pass, but a description already sitting on the captured candidate
+// is free and should not be thrown away). Capped to bound batch token cost,
+// not because the judge shouldn't see it.
+const DESCRIPTION_SNIPPET_CHARS = 600;
+
+function formatCandidateBlock(c, i) {
+  const header = `${i}. "${c.title}" — ${c.company} — ${c.location || 'location unknown'} — source: ${c.source || 'unknown'}${c.posted_at ? ` — posted: ${c.posted_at}` : ''}`;
+  if (typeof c.description === 'string' && c.description.trim()) {
+    const snippet = c.description.trim().slice(0, DESCRIPTION_SNIPPET_CHARS).replace(/\s+/g, ' ');
+    return `${header}\n   description (excerpt, already on hand — not a new fetch): ${snippet}${c.description.length > DESCRIPTION_SNIPPET_CHARS ? '…' : ''}`;
+  }
+  return `${header}\n   description: (not available for this posting)`;
+}
+
+/**
+ * Facts-only in the sense that matters: no NEW fetch happens for this pass
+ * (a JD is never retrieved solely to judge relevance). If the provider
+ * already supplied a description at capture time, it rides along as free
+ * evidence, per explicit policy ("if description is present ... USE IT").
+ *
+ * @param {object[]} batch
+ * @returns {string}
+ */
 export function buildJudgePrompt(batch) {
-  const list = batch
-    .map((c, i) => `${i}. "${c.title}" — ${c.company} — ${c.location || 'location unknown'} — source: ${c.source || 'unknown'}`)
-    .join('\n');
-  return `You are a fast, cheap relevance triage step. Decide only whether each posting's TITLE could plausibly belong to the candidate's target problem spaces — you are NOT given the job description, so decide from title/company/location alone. This is a coarse first pass, not a final verdict: postings you mark "high" still go through a full evaluation before anything is applied to.
+  const list = batch.map(formatCandidateBlock).join('\n');
+  return `You are a fast, cheap relevance triage step for a job-search discovery pipeline. Each posting below already FAILED a literal keyword title filter — that is exactly why this pass exists. Decide only: could this role plausibly belong to one of the candidate's target problem spaces despite not matching an existing title keyword? This is a coarse first pass, not a final verdict: postings you mark "high" still go through a full evaluation (reading the complete JD, matching against the candidate's actual CV) before anything is applied to.
 
-Target problem spaces: manufacturing transformation, Industry 4.0 / MES / MOM / QMS, industrial AI, forward-deployed or customer-facing solutions engineering, technical presales/GTM for manufacturing software. A title does not need to literally contain any of these words — that is exactly why this pass exists (they already failed a keyword filter). Judge plausibility, not string overlap.
+TARGET PROBLEM SPACES (the underlying functions/domains, not a keyword list — judge plausibility, not string overlap):
+- Manufacturing, semiconductor, and industrial operations
+- MES / MOM / QMS (manufacturing execution, operations management, quality management systems)
+- Smart factory / Industry 4.0
+- Manufacturing analytics: yield, quality, process optimization
+- Industrial AI
+- Customer-facing technical solutioning
+- Solutions engineering / presales
+- Implementation / deployment of manufacturing or industrial software
+- Discovery, requirements-gathering, or proof-of-concept (POC) work with customers
+- Technical GTM (go-to-market)
+- Manufacturing systems integration (connecting shop-floor/plant data to enterprise systems)
 
-When genuinely unsure, answer "low" or "medium" — never "high" on a guess. "high" means you would be surprised if this role turned out irrelevant once someone reads the actual JD.
+STRONG RELEVANCE SIGNALS (raise confidence toward high/medium):
+- Works directly with factories, fabs, plants, or manufacturers
+- Technical customer engagement (not just relationship management)
+- Discovery/requirements work, demos, or POCs with customers
+- Deployment or implementation of a technical product at a customer site
+- Manufacturing systems or plant-data integration
+- Operational improvement work (yield, throughput, quality, downtime)
+- AI/analytics applied to a real production environment
+
+STRONG EXCLUSIONS (push toward low, even if the company is in this industry):
+- Generic SaaS sales (no manufacturing/industrial specificity)
+- Pure generic software engineering (no customer-facing or domain-specific signal)
+- Consumer AI or consumer products
+- Unrelated finance/accounting roles
+- Generic IT support/helpdesk
+- Unrelated SDR/BDR roles with no industrial/manufacturing focus
+- Unrelated facilities/workplace/office-operations roles (a role that MANAGES a physical workplace, not a manufacturing customer)
+
+A company being in the manufacturing/industrial sector does NOT by itself make every role there relevant — an accountant or office-facilities manager at a fab is still low. Judge the ROLE's function against the target problem spaces above, not the employer's industry alone.
+
+Evidence for each posting below: title, company, location, source, posted date, and a description excerpt IF the original provider already supplied one (never invented, never fetched new — some postings have none, which is not itself a negative signal).
+
+RULES:
+- "high" ONLY when there is strong, specific evidence of genuine target relevance — you would be surprised if this role turned out irrelevant once someone reads the complete JD.
+- "medium" for plausible but genuinely ambiguous adjacency.
+- "low" for weak or unrelated evidence.
+- When uncertain, bias toward medium/low, never high. A guess dressed up as confidence is worse than an honest "medium".
 
 Postings:
 ${list}
@@ -142,27 +202,11 @@ export function parseJudgeResponse(text) {
     .map((r) => ({ id: r.id, confidence: r.confidence, reason: String(r.reason ?? '').slice(0, 200) }));
 }
 
-/**
- * KNOWN LIMITATION (not fixed here — see the module header and the
- * implementation report): on Windows, npm's global-install shim for a CLI
- * like `claude` is a `.cmd` file, and plain execFileSync cannot invoke it
- * without shell involvement. Two things were tried and rejected during
- * implementation:
- *   - shell:true — rejected outright: job titles/companies are untrusted
- *     external content flowing into this call, and Node's own docs warn
- *     shell:true is injectable with unsanitized input.
- *   - `cmd.exe /c <target> <args...>` (the cross-spawn-style workaround) —
- *     tried and reverted: empirically, cmd.exe's own reparsing of the
- *     prompt argument (quotes, etc.) silently mangled it down to nothing
- *     rather than failing loudly. A silent wrong-answer is worse than a
- *     loud, caught ENOENT that leaves the candidate safely un-promoted for
- *     stale-recovery, which is what the plain call below does.
- * This mirrors rank-pipeline.mjs's own callCli exactly (same limitation,
- * pre-existing, not introduced here) rather than shipping an unverified fix.
- */
-function execCliFile(bin, args, opts) {
-  return execFileSync(bin, args, opts);
-}
+// See cli-exec.mjs's header for the full root-cause writeup: resolves the
+// real target a Windows npm .cmd shim launches (claude.cmd -> claude.exe on
+// this machine) and invokes it directly, argv-only, no shell -- fixing the
+// ENOENT/EINVAL pair that a bare execFileSync('claude', ...) hit.
+const execCliFile = execCliSafely;
 
 /**
  * Adapted from rank-pipeline.mjs's callCli — requests --output-format json

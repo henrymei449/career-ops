@@ -30,6 +30,7 @@
  * writes: this module never touches main() or argv.
  */
 import { classifyTier } from './classify-tier.mjs';
+import { classifyLocation, workdayUrlHint } from './location-tier.mjs';
 import { normalizeUrlForDedup, companyRoleDedupKey, matchedTitleKeywords } from './scan.mjs';
 
 /**
@@ -126,6 +127,53 @@ export function runDedupChecks(job, dedupState = {}) {
   }
 
   return { accepted: true, dedupUrl, key, baseKey };
+}
+
+/**
+ * Recall-ONLY additional geography gate — deliberately NOT part of
+ * runStructuralChecks/runPostTitleGate, so Lane A's own chain (which those
+ * two functions also run, unchanged) never sees it. Lane A's geography
+ * policy stays exactly `locationFilter` (buildLocationFilter, possibly a
+ * no-op today since this profile has no location_filter configured) —
+ * this function is an EXTRA check the capture hook applies only to
+ * candidates that already failed title_filter, so an obviously non-US
+ * posting never consumes semantic-recall LLM budget.
+ *
+ * Uses location-tier.mjs's classifyLocation (already shipped, already used
+ * by discovery-report.mjs) rather than inventing a second geography
+ * classifier. Only Tier 1 ("excluded" -- a confirmed non-US signal, e.g. a
+ * named country/city) rejects; every other bucket (needs-validation,
+ * location-friction, primary) still reaches the recall pool, so a merely
+ * ambiguous location is never over-tightened out of recall.
+ *
+ * @param {{location?: string, title?: string, url?: string}} job
+ * @returns {boolean} true if NOT obviously non-US (eligible to continue)
+ */
+export function isRecallGeographyEligible(job) {
+  const classified = classifyLocation({
+    location: job.location,
+    title: job.title,
+    urlHint: workdayUrlHint(job.url || ''),
+  });
+  return classified.bucket !== 'excluded';
+}
+
+/**
+ * Full recall-capture eligibility: the same no-fetch structural checks Lane
+ * A runs (tier/location_filter/posting-age/posted-date/salary), PLUS the
+ * recall-only geography gate above. Used ONLY by the capture hooks in
+ * scan.mjs / scan-ats-full.mjs — Lane A's own loop calls runStructuralChecks
+ * directly (via runPostTitleGate) and never this function.
+ *
+ * @param {object} job
+ * @param {object} filters - same shape as runStructuralChecks
+ * @returns {GateResult}
+ */
+export function runRecallEligibilityChecks(job, filters = {}) {
+  const structural = runStructuralChecks(job, filters);
+  if (!structural.accepted) return structural;
+  if (!isRecallGeographyEligible(job)) return { accepted: false, reason: 'non_us_geography' };
+  return { accepted: true };
 }
 
 /**

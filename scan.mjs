@@ -76,7 +76,7 @@ import { printScanSummaryHeader } from './lib/scan-summary-marker.mjs';
 import { isMainModule } from './lib/is-main-module.mjs';
 import { promoteKnownFragmentIdentity } from './url-key.mjs';
 import { buildSuppressionIndexFromText } from './discard-suppression.mjs';
-import { runStructuralChecks } from './post-title-gate.mjs';
+import { runRecallEligibilityChecks } from './post-title-gate.mjs';
 import { appendRecallCandidateIfNew } from './recall-store.mjs';
 
 try {
@@ -2343,7 +2343,7 @@ export function formatPipelineOffer(offer) {
 }
 
 // postedAt arrives as epoch ms (or absent). Convert to 'YYYY-MM-DD', or '' when missing.
-function postedAtIsoDate(postedAt) {
+export function postedAtIsoDate(postedAt) {
   if (typeof postedAt !== 'number' || !Number.isFinite(postedAt) || postedAt <= 0) return '';
   return new Date(postedAt).toISOString().slice(0, 10);
 }
@@ -3375,12 +3375,13 @@ async function main() {
         if (!titleFilter(job.title)) {
           totalFilteredTitle++;
           if (captureRecallRejects && !dryRun) {
-            // No-fetch eligibility only (tier/location/posting-age/posted-date/
-            // salary) — every one operates on fields already on `job`, zero
-            // extra fetch. A reject here never enters the Lane B holding pen;
-            // this keeps the recall pool free of postings that would fail on
-            // geography/staleness/comp regardless of title relevance.
-            const eligibility = runStructuralChecks(job, { skipTiers, locationFilter, postingAgeFilter, postedDateFilter, salaryFilter });
+            // No-fetch eligibility (tier/location_filter/posting-age/posted-
+            // date/salary) PLUS a recall-only "obviously non-US" geography
+            // gate (location-tier.mjs's classifyLocation, Tier 1 only) --
+            // deliberately NOT part of Lane A's own shared gate, so this
+            // never changes Lane A's behavior. Every field used here is
+            // already on `job`, zero extra fetch.
+            const eligibility = runRecallEligibilityChecks(job, { skipTiers, locationFilter, postingAgeFilter, postedDateFilter, salaryFilter });
             if (eligibility.accepted) {
               await appendRecallCandidateIfNew({
                 url: job.url,

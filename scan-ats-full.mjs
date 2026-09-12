@@ -54,7 +54,9 @@ import lever from './providers/lever.mjs';
 import ashby from './providers/ashby.mjs';
 import workday from './providers/workday.mjs';
 import icims from './providers/icims.mjs';
-import { buildTitleFilter, buildTitleFilterOverrides, buildTitleFilterWithOverrides, buildLocationFilter, buildContentFilter, matchedTitleKeywords, loadSeenUrls, normalizeUrlForDedup, appendToPipeline, appendToScanHistory, loadBlacklist, parseSinceDays, PORTALS_PATH, PIPELINE_PATH } from './scan.mjs';
+import { buildTitleFilter, buildTitleFilterOverrides, buildTitleFilterWithOverrides, buildLocationFilter, buildContentFilter, matchedTitleKeywords, loadSeenUrls, normalizeUrlForDedup, appendToPipeline, appendToScanHistory, loadBlacklist, parseSinceDays, postedAtIsoDate, PORTALS_PATH, PIPELINE_PATH } from './scan.mjs';
+import { runRecallEligibilityChecks } from './post-title-gate.mjs';
+import { appendRecallCandidateIfNew } from './recall-store.mjs';
 import { localToday } from './lib/local-today.mjs';
 import { printScanSummaryHeader } from './lib/scan-summary-marker.mjs';
 import { SEED_SOURCES, toPortalEntry } from './seeds/vc-portfolios.mjs';
@@ -262,7 +264,7 @@ export const SOURCES = {
 const KNOWN_FLAGS = [
   '--since', '--limit', '--ats', '--seeds', '--dry-run', '--liveness',
   '--verbose', '--md-out', '--json', '--include-undated', '--include-blacklisted',
-  '--shuffle', '--resume', '--help', '-h',
+  '--shuffle', '--resume', '--help', '-h', '--capture-recall-rejects',
 ];
 
 // Flags that consume the next argv token as a value (space-separated form —
@@ -351,6 +353,11 @@ function parseArgs(argv) {
     includeBlacklisted: args.includes('--include-blacklisted'),
     shuffle: args.includes('--shuffle'),
     resume: args.includes('--resume'),
+    // Lane B (semantic-recall) capture — opt-in, default off, same flag
+    // name and same meaning as scan.mjs's own. This is the primary
+    // intended volume source (the broad reverse-ATS sweep), but Lane A's
+    // own behavior here is completely unaffected either way.
+    captureRecallRejects: args.includes('--capture-recall-rejects'),
   };
 }
 
@@ -859,7 +866,32 @@ async function main() {
       }
       if (dateClass === 'stale') continue;
       if (dateClass === 'undated' && !opts.includeUndated) { droppedNoDate++; continue; }
-      if (!titleFilter(job.title, companySlug)) continue;
+      if (!titleFilter(job.title, companySlug)) {
+        // Lane B (semantic-recall) capture — opt-in, default off. This is
+        // the primary intended volume source (the broad reverse-ATS
+        // sweep), wired through the SAME shared primitives scan.mjs uses:
+        // no-fetch structural eligibility (here just location_filter --
+        // this script has no skip_tiers/salary_filter concept, and
+        // undated/stale postings were already dropped above before
+        // reaching titleFilter) plus the recall-only geography gate
+        // (obviously non-US rejects never consume LLM budget). Never an
+        // extra fetch: every field used here is already on `job`.
+        if (opts.captureRecallRejects && !opts.dryRun) {
+          const eligibility = runRecallEligibilityChecks(job, { locationFilter });
+          if (eligibility.accepted) {
+            await appendRecallCandidateIfNew({
+              url: job.url,
+              title: job.title,
+              company: job.company || companySlug,
+              location: job.location,
+              postedAt: postedAtIsoDate(job.postedAt) || null,
+              source: sourceName,
+              description: typeof job.description === 'string' ? job.description : null,
+            });
+          }
+        }
+        continue;
+      }
       // job.url is passed so the location filter can fall back to the URL's own
       // location segment when the provider reports a rolled-up "N Locations" string;
       // job.title so a title-stated remote role survives a city-only location.

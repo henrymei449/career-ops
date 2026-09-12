@@ -15,12 +15,42 @@ const RECALL_RELEVANCE_URL = pathToFileURL(join(ROOT, 'recall-relevance.mjs')).h
 
 // ── Pure functions ───────────────────────────────────────────────────────
 
-test('buildJudgePrompt: includes every candidate, numbered, facts only (no description leaked)', () => {
+test('buildJudgePrompt: includes every candidate, numbered, with structured facts', () => {
   const prompt = buildJudgePrompt([
-    { title: 'Customer Deployment Lead', company: 'Acme', location: 'Remote', source: 'reverse-ats', description: 'SECRET JD TEXT' },
+    { title: 'Customer Deployment Lead', company: 'Acme', location: 'Remote', source: 'reverse-ats' },
   ]);
   assert.match(prompt, /0\. "Customer Deployment Lead" — Acme — Remote — source: reverse-ats/);
-  assert.doesNotMatch(prompt, /SECRET JD TEXT/, 'the facts-only judge must never see JD description text');
+});
+
+// Phase 6, explicit policy: "If description is present from the original
+// provider response, USE IT. Do not fetch a new JD solely for this cheap
+// pass." -- "facts-only" means no NEW fetch, not "never show what's
+// already on hand". This is a deliberate reversal of this suite's earlier
+// assumption, per that explicit instruction.
+test('buildJudgePrompt: includes a provider-supplied description when already present (no new fetch, but use what is on hand)', () => {
+  const prompt = buildJudgePrompt([
+    { title: 'Customer Deployment Lead', company: 'Acme', location: 'Remote', source: 'reverse-ats', description: 'Deploys manufacturing execution systems at customer fabs.' },
+  ]);
+  assert.match(prompt, /Deploys manufacturing execution systems at customer fabs\./);
+});
+
+test('buildJudgePrompt: a missing description is labeled, not silently blank', () => {
+  const prompt = buildJudgePrompt([{ title: 'Customer Deployment Lead', company: 'Acme', location: 'Remote', source: 'reverse-ats' }]);
+  assert.match(prompt, /description: \(not available for this posting\)/);
+});
+
+test('buildJudgePrompt: a long description is truncated (bounds batch token cost) rather than included in full', () => {
+  const longDescription = 'A'.repeat(5000);
+  const prompt = buildJudgePrompt([{ title: 'X', company: 'Y', location: 'Z', source: 's', description: longDescription }]);
+  assert.ok(prompt.length < longDescription.length + 3000, 'the full 5000-char description must not be inlined verbatim');
+  assert.match(prompt, /…/, 'truncation should be visibly marked');
+});
+
+test('buildJudgePrompt: never fabricates target-profile content beyond what was specified (spot-check key phrases present)', () => {
+  const prompt = buildJudgePrompt([{ title: 'X', company: 'Y', location: 'Z', source: 's' }]);
+  for (const phrase of ['MES / MOM / QMS', 'Smart factory / Industry 4.0', 'Solutions engineering / presales', 'Generic SaaS sales', 'Unrelated facilities/workplace/office-operations roles']) {
+    assert.ok(prompt.includes(phrase), `expected target-profile phrase missing: "${phrase}"`);
+  }
 });
 
 test('parseJudgeResponse: parses a clean JSON array', () => {

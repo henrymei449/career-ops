@@ -16,8 +16,9 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SCAN = join(ROOT, 'scan.mjs');
 const NODE = process.execPath;
 const FIXTURE_PARSER_REL = 'test-fixtures/recall-capture-parser.mjs';
+const FIXTURE_NONUS_PARSER_REL = 'test-fixtures/recall-capture-nonus-parser.mjs';
 
-function workspace({ titleFilter }) {
+function workspace({ titleFilter, parser = FIXTURE_PARSER_REL }) {
   const root = mkdtempSync(join(tmpdir(), 'career-ops-recall-capture-'));
   mkdirSync(join(root, 'data'), { recursive: true });
   mkdirSync(join(root, 'config'), { recursive: true });
@@ -31,7 +32,7 @@ function workspace({ titleFilter }) {
     '    enabled: true',
     '    parser:',
     '      command: node',
-    `      script: ${JSON.stringify(FIXTURE_PARSER_REL)}`,
+    `      script: ${JSON.stringify(parser)}`,
     'title_filter:',
     `  positive: [${titleFilter.positive.map((s) => JSON.stringify(s)).join(', ')}]`,
     '  negative: []',
@@ -136,6 +137,17 @@ test('capture is idempotent across repeated scans of the same reject (no duplica
     const jsonlPath = join(root, 'data', 'recall-candidates.jsonl');
     const rows = readFileSync(jsonlPath, 'utf-8').trim().split('\n').filter(Boolean);
     assert.equal(rows.length, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('capture end-to-end: an obviously non-US reject (Toronto, ON, CAN — the real Autodesk shape) never enters the recall pool', () => {
+  const root = workspace({ titleFilter: { positive: ['Solutions Engineer'] }, parser: FIXTURE_NONUS_PARSER_REL });
+  try {
+    const result = runScan(root, ['--capture-recall-rejects'], { dryRun: false });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(existsSync(join(root, 'data', 'recall-candidates.jsonl')), false, 'the geography gate must reject this before any capture write happens');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

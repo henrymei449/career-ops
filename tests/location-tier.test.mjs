@@ -63,4 +63,20 @@ check('"2 Locations" WITH a resolvable URL hint (Mumbai, India) resolves non-US,
 // Non-US always excluded from the actionable queue, even when phrased as remote.
 check('non-US remote is never promoted to Tier 5', { location: 'Germany · Remote' }, 1, { actionable: false });
 
+// ── Semantic-recall geography regression (real captures, real gap) ────
+// A real recall dry-run sampled these three; two of three slipped past the
+// classifier as Tier 3 (needs-validation) instead of Tier 1 (excluded)
+// before KNOWN_NON_US_CITIES was extended. Brisbane was ALREADY correct
+// (matches NON_US_COUNTRY_RE's "australia") — included as a baseline.
+check('"Toronto, ON, CAN" (Autodesk, real capture) — province/country abbreviations, not full words', { location: 'Toronto, ON, CAN' }, 1, { usRelevant: 'FALSE' });
+check('"Brisbane, Australia" (AVEVA, real capture) — already correct before this fix (full country word)', { location: 'Brisbane, Australia' }, 1, { usRelevant: 'FALSE' });
+check('bare "NOIDA" (Cadence, real capture) — no country/state token at all', { location: 'NOIDA' }, 1, { usRelevant: 'FALSE' });
+
+// Ambiguous-but-ok-for-recall cases must NOT be over-tightened into Tier 1 —
+// recall still wants a shot at these, per explicit policy.
+check('"New York, NY" stays Tier 5 (unaffected by the city-list change)', { location: 'New York, NY' }, 5, { usRelevant: 'TRUE', nycMetro: true });
+check('"Remote - United States" stays Tier 5', { location: 'Remote - United States' }, 5, { usRelevant: 'TRUE', remoteUS: true });
+check('bare "Remote" (no country context) stays Tier 3 needs-validation, NOT excluded — still eligible for recall', { location: 'Remote' }, 3, { needsValidation: true, usRelevant: 'UNKNOWN' });
+check('"3 Locations" (AVEVA, real capture) — vague display string stays Tier 3, not excluded', { location: '3 Locations' }, 3, { needsValidation: true, usRelevant: 'UNKNOWN' });
+
 console.log(`\nlocation-tier: done`);
