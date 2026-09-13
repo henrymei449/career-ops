@@ -5,16 +5,21 @@
 // directions. The seed-bare/candidate-located direction was already covered; the
 // reverse was not. This board produces it (#3751 review).
 //
-// Run 1 (FIXTURE_RELIST unset) posts /3001 in "London, UK", seeding the located
-//   key company::role@@london+uk into scan-history.tsv and pipeline.md.
-// Run 2 (FIXTURE_RELIST=locationless) posts /3002 — a new url, so url dedupe can
-//   not help — for the SAME role with the location field absent. Its own key is
-//   therefore the BARE key, which matches neither the located seed nor a bare
-//   seed (there is none), so before the reverse index it was added as a second
-//   entry for a role the scan already had.
-// Run 2 (FIXTURE_RELIST=different) posts /3002 in Dublin, a genuinely different
-//   place, which MUST still be added. That is the control: making the wildcard
-//   symmetric must not collapse two real cities into one.
+// Run 1 (FIXTURE_RELIST unset) posts /3001 in "New York, NY", seeding the
+//   located key company::role@@new+york+ny into scan-history.tsv and
+//   pipeline.md. (Originally "London, UK" — swapped 2026-09-13 so run 1
+//   itself clears location-tier.mjs's classifyGeography gate under the
+//   "Actual CareerOps geography policy"; see the note further down about
+//   what this changes for the locationless mode specifically.)
+// Run 2 (FIXTURE_RELIST=locationless) posts /3002 — a new url, so url dedupe
+//   can not help — for the SAME role with the location field absent. Its own
+//   key is therefore the BARE key, which matches neither the located seed
+//   nor a bare seed (there is none), so before the reverse index it was
+//   added as a second entry for a role the scan already had.
+// Run 2 (FIXTURE_RELIST=different) posts /3002 in Jersey City, NJ, a
+//   genuinely different (and NYC-compatible) place, which MUST still be
+//   added. That is the control: making the wildcard symmetric must not
+//   collapse two real cities into one.
 //
 // A provider returning an empty location for a posting that has one is ordinary,
 // not exotic — the field is optional on every ATS this scanner reads, and the
@@ -27,7 +32,7 @@ const mode = process.env.FIXTURE_RELIST || '';
 const job = mode === 'locationless'
   ? { url: 'https://boards.example.com/fixture/3002' }
   : mode === 'different'
-    ? { url: 'https://boards.example.com/fixture/3002', location: 'Dublin, IE' }
-    : { url: 'https://boards.example.com/fixture/3001', location: 'London, UK' };
+    ? { url: 'https://boards.example.com/fixture/3002', location: 'Jersey City, NJ' }
+    : { url: 'https://boards.example.com/fixture/3001', location: 'New York, NY' };
 
 console.log(JSON.stringify([{ title: ROLE, company: COMPANY, ...job }]));

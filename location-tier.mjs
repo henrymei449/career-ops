@@ -1,8 +1,13 @@
 // output/location-tier.mjs — location-tier classifier for the targeted-company
-// dry-run CSV export ONLY. Not part of career-ops' core location_filter
-// (portals.yml, scan.mjs) — a separate, standalone heuristic for one custom
-// export, built and tested on its own so it can be corrected without touching
-// title filters, scoring, providers, or any in-scope profile/CV content.
+// dry-run CSV export, and (via classifyStructuredWorkplace below) scan.mjs's
+// structured-workplace-metadata gate for actors that return real
+// remote/onsite/hybrid fields (currently: curious_coder/linkedin-jobs-scraper
+// via plugins/apify). Not part of career-ops' core `location_filter`
+// (portals.yml's own text-substring config, still evaluated separately and
+// unchanged in scan.mjs) — this module supplies the NYC-actionability
+// judgment both consumers need, built and tested on its own so it can be
+// corrected without touching title filters, scoring, providers, or any
+// in-scope profile/CV content.
 //
 // Canonical policy (2026-09-07, per user directive): tiers reflect actionable
 // geography for Henry (NYC-based), not raw US-vs-non-US. Tier 3 means "needs
@@ -131,6 +136,150 @@ export function classifyLocation({ location = '', title = '', urlHint = '' } = {
   // No US signal, no non-US signal, not a recognized vague form (e.g. free
   // text this classifier doesn't recognize) — unknown, not favorable.
   return { tier: 3, usRelevant: 'UNKNOWN', remoteUS: false, nycMetro: false, needsValidation: true, actionable: false, bucket: 'needs-validation' };
+}
+
+// ── Actual CareerOps geography policy (2026-09-13) ─────────────────────────
+//
+// An opportunity is actionable ONLY if it is (1) confirmed Remote U.S., or
+// (2) onsite/hybrid inside the EXISTING approved NYC-compatible geography
+// (classifyLocation's nycMetro boundaries, unchanged, never broadened here).
+// Everything else is REJECT. There is no more "lower-priority US geography"
+// concept — a confirmed onsite/hybrid US posting outside NYC used to be
+// permissively passed through (portals.yml's location_filter is unconfigured
+// in production, so it defaulted to "all locations pass") or surfaced as a
+// MARGINAL report row; neither of those is a real decision under this
+// policy. classifyLocation's numeric `tier` field (1-5) is kept ONLY as
+// legacy metadata for its original consumer (the targeted-company dry-run
+// CSV export) and any other exporter that reads it — it MUST NOT be branched
+// on here or anywhere in this policy. Decisions below read only the
+// semantic `bucket` field (itself derived from the same tier boundaries,
+// just not the ranked-priority number) and the `remoteUS`/`nycMetro` flags.
+//
+// Four explicit decision states (never inferred from an absent field):
+//   REMOTE_US        — confirmed remote, US-eligible. Physical job/company
+//                       location outside NYC never matters for this state.
+//   NYC_COMPATIBLE   — onsite/hybrid inside the existing NYC-actionable
+//                       geography (classifyLocation bucket 'primary' via
+//                       nycMetro, NOT via its remoteUS branch — that's
+//                       REMOTE_US instead, see classifyLocationFallback).
+//   UNKNOWN          — evidence genuinely cannot establish REMOTE_US,
+//                       NYC_COMPATIBLE, or REJECT (e.g. bare "United
+//                       States", absent/conflicting workplace metadata).
+//                       A real, testable return value of these pure
+//                       functions — but see classifyGeography() below and
+//                       scan.mjs's own wiring: an UNKNOWN that survives
+//                       BOTH classification stages is never treated as
+//                       accepted by the pipeline, exactly like REJECT.
+//   REJECT           — clearly non-US, OR a confirmed onsite/hybrid US
+//                       location outside NYC-compatible geography (no
+//                       exceptions for "still pretty good" geography).
+//
+// curious_coder/linkedin-jobs-scraper returns `workRemoteAllowed` (boolean)
+// and `workplaceTypes` (string/array, e.g. "Remote"/"On-site"/"Hybrid") per
+// job — real, actor-native signal, never inferred from JD text. Every other
+// provider, and any LinkedIn job the actor didn't tag, leaves both fields
+// unset on the job object (see plugins/apify/index.mjs's normalizeItem), so
+// classifyStructuredWorkplace() below is UNKNOWN for those — a strict
+// deferral to classifyLocationFallback(), never a fabricated decision.
+const WORKPLACE_REMOTE_RE = /remote/i;
+const WORKPLACE_ONSITE_RE = /on[\s-]?site/i;
+const WORKPLACE_HYBRID_RE = /hybrid/i;
+
+function normalizeWorkplaceTypes(value) {
+  if (Array.isArray(value)) return value.map(v => String(v || ''));
+  if (typeof value === 'string' && value.trim()) return [value];
+  return [];
+}
+
+/**
+ * Stage 1 — structured actor metadata, when present. Returns UNKNOWN (never
+ * REJECT) whenever the job carries no workRemoteAllowed/workplaceTypes
+ * signal at all, or a conflicting one (e.g. both Remote and On-site
+ * listed) — UNKNOWN means "defer to classifyLocationFallback," nothing more.
+ *
+ * @param {{location?: string, title?: string, urlHint?: string,
+ *   workRemoteAllowed?: boolean, workplaceTypes?: string|string[]}} job
+ * @returns {{state: 'REMOTE_US'|'NYC_COMPATIBLE'|'REJECT'|'UNKNOWN', reason: string}}
+ */
+export function classifyStructuredWorkplace(job = {}) {
+  const types = normalizeWorkplaceTypes(job.workplaceTypes);
+  const remoteAllowed = job.workRemoteAllowed === true;
+  const hasRemoteSignal = remoteAllowed || types.some(t => WORKPLACE_REMOTE_RE.test(t));
+  const hasOnsiteOrHybridSignal = types.some(t => WORKPLACE_ONSITE_RE.test(t) || WORKPLACE_HYBRID_RE.test(t));
+
+  if (!hasRemoteSignal && !hasOnsiteOrHybridSignal) {
+    return { state: 'UNKNOWN', reason: 'no-structured-workplace-signal' };
+  }
+  if (hasRemoteSignal && hasOnsiteOrHybridSignal) {
+    return { state: 'UNKNOWN', reason: 'conflicting-workplace-signals' };
+  }
+
+  // Non-US is checked here, same as classifyLocation's own ordering (#2789-
+  // era policy comment above), so a "Remote" tag on a clearly non-US posting
+  // can never rescue it — but ONLY once we already know the job carries a
+  // real structured workplace signal (never a bare location-only check,
+  // which is classifyLocationFallback's job, not this function's).
+  const location = classifyLocation({ location: job.location, title: job.title, urlHint: job.urlHint });
+  if (location.bucket === 'excluded') {
+    return { state: 'REJECT', reason: 'non-us-location' };
+  }
+  if (hasRemoteSignal) {
+    return { state: 'REMOTE_US', reason: 'structured-remote' };
+  }
+  // hasOnsiteOrHybridSignal, mutually exclusive with hasRemoteSignal above.
+  return location.bucket === 'primary'
+    ? { state: 'NYC_COMPATIBLE', reason: 'structured-onsite-hybrid-nyc-actionable' }
+    : { state: 'REJECT', reason: 'structured-onsite-hybrid-outside-nyc' };
+}
+
+/**
+ * Stage 2 — the "fallback location/geography validation" that runs ONLY
+ * when classifyStructuredWorkplace() returned UNKNOWN. Bare-location
+ * classification via the EXISTING classifyLocation() boundaries (unchanged,
+ * never broadened) — no numeric-tier branching, per the policy note above.
+ *
+ * Mapping (bucket -> state), exhaustive:
+ *   'excluded'          -> REJECT (clearly non-US)
+ *   'primary', remoteUS -> REMOTE_US ("Remote - United States"-shaped text)
+ *   'primary', nycMetro -> NYC_COMPATIBLE (a plain NYC-metro/commutable city)
+ *   'location-friction' -> REJECT (confirmed US, but outside NYC-compatible
+ *                          geography, and no remote signal at either stage —
+ *                          this is the actual policy change: there is no
+ *                          more "confirmed US, lower priority" pass-through)
+ *   'needs-validation'  -> UNKNOWN (bare "United States", vague strings —
+ *                          evidence genuinely insufficient either way)
+ *
+ * @returns {{state: 'REMOTE_US'|'NYC_COMPATIBLE'|'REJECT'|'UNKNOWN', reason: string}}
+ */
+export function classifyLocationFallback(job = {}) {
+  const location = classifyLocation({ location: job.location, title: job.title, urlHint: job.urlHint });
+  switch (location.bucket) {
+    case 'excluded':
+      return { state: 'REJECT', reason: 'non-us-location' };
+    case 'primary':
+      return location.remoteUS
+        ? { state: 'REMOTE_US', reason: 'location-tier-remote-us-text' }
+        : { state: 'NYC_COMPATIBLE', reason: 'location-tier-nyc-metro' };
+    case 'location-friction':
+      return { state: 'REJECT', reason: 'location-tier-us-non-nyc' };
+    case 'needs-validation':
+    default:
+      return { state: 'UNKNOWN', reason: 'location-tier-needs-validation' };
+  }
+}
+
+/**
+ * The combined gate scan.mjs actually calls: stage 1, then (only if stage 1
+ * is genuinely UNKNOWN) stage 2. The return value can still be UNKNOWN (see
+ * the module note above) — scan.mjs's own wiring is what ensures an UNKNOWN
+ * final state is never treated as accepted, exactly like REJECT.
+ *
+ * @returns {{state: 'REMOTE_US'|'NYC_COMPATIBLE'|'REJECT'|'UNKNOWN', reason: string}}
+ */
+export function classifyGeography(job = {}) {
+  const structured = classifyStructuredWorkplace(job);
+  if (structured.state !== 'UNKNOWN') return structured;
+  return classifyLocationFallback(job);
 }
 
 // Pure local string parsing of a Workday job URL's `/job/{Location-Slug}/`

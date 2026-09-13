@@ -489,23 +489,38 @@ tracked_companies:
 }
 
 // 8c. END-TO-END: the reverse wildcard direction (#3751 review) ─────────────
-// Run 1 seeds the role in London. Run 2 re-lists the SAME role at a NEW url
-// (url dedupe cannot help) with NO location, so the candidate's own key is the
-// bare wildcard and matches neither the located seed nor any bare seed. Before
-// the reverse index it was added — an already-surfaced role coming back a
-// second time, which is precisely what the wildcard exists to stop.
+// Run 1 seeds the role in New York, NY. Run 2 re-lists the SAME role at a NEW
+// url (url dedupe cannot help) with NO location, so the candidate's own key
+// is the bare wildcard and matches neither the located seed nor any bare
+// seed. Before the reverse index it was added — an already-surfaced role
+// coming back a second time, which is precisely what the wildcard exists to
+// stop. The underlying dedup mechanism (companyRoleDedupKey's wildcard key,
+// and the reverse index matching it against a located seed) is unit-tested
+// directly above ("a located seed records its bare key in the reverse
+// index", "the reverse index does not collapse two distinct roles at one
+// company") and unaffected by anything below.
 //
-// Its control is the run below it: a real second city at the same new url must
-// STILL be added, or the symmetry was bought by deduping everything.
+// 2026-09-13 note: under the "Actual CareerOps geography policy"
+// (location-tier.mjs's classifyGeography), a posting with NO location at all
+// resolves UNKNOWN and is now rejected at the geography gate BEFORE dedup
+// logic ever runs — so run 2 here is suppressed by geography, not by the
+// reverse-wildcard match, regardless of whether the dedup fix is even
+// present. This end-to-end run can no longer distinguish "the wildcard dedup
+// works" from "blank-location postings are unconditionally rejected now" —
+// both produce the same afterSecond=1 outcome. It's kept (renamed) because
+// "a blank-location re-list never reaches the pipeline" is still a real,
+// worthwhile invariant to guard with a live scan.mjs run; it just isn't
+// proof of the #3751 wildcard fix specifically anymore — that proof lives
+// entirely in the pure-function tests above.
 const LOCATIONLESS_BOARD = 'tests/fixtures/locationless-relist-board.mjs';
 
 {
   try {
     const { afterFirst, afterSecond } = runScanRelist('locationless', LOCATIONLESS_BOARD);
     if (afterFirst === 1 && afterSecond === 1) {
-      pass('a located seed suppresses a later locationless re-list (wildcard holds in both directions)');
+      pass('a blank-location re-list never reaches the pipeline (rejected by the geography gate ahead of dedup — see 2026-09-13 note)');
     } else {
-      fail(`reverse wildcard leaked: ${afterFirst} entries after run 1, ${afterSecond} after run 2 (want 1 and 1)`);
+      fail(`locationless re-list leaked: ${afterFirst} entries after run 1, ${afterSecond} after run 2 (want 1 and 1)`);
     }
   } catch (err) {
     fail(`e2e locationless re-list scan failed: ${err.message}`);

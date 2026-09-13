@@ -9,12 +9,18 @@
 // string as a different place and re-adds a posting the scan already has; a key
 // built from the sorted SET of places does not.
 //
-// Run 1 (FIXTURE_RELIST unset) posts /2001 as "London, UK | Dublin, IE".
+// Run 1 (FIXTURE_RELIST unset) posts /2001 as "New York, NY | Jersey City, NJ".
 // Run 2 (FIXTURE_RELIST=reordered) posts /2002 — a new url, so url dedupe can
-//   not help — as "Dublin, IE | London, UK", the same two cities re-ordered.
-// Run 2 (FIXTURE_RELIST=different) posts /2002 in Berlin, a genuinely different
-//   place, which MUST still be added. That is the control: the fix must dedupe
-//   a re-ordering without deduping a real second city.
+//   not help — as "Jersey City, NJ | New York, NY", the same two places re-ordered.
+// Run 2 (FIXTURE_RELIST=different) posts /2002 in Stamford, CT, a genuinely
+//   different place, which MUST still be added. That is the control: the fix
+//   must dedupe a re-ordering without deduping a real second city.
+//
+// Places are all NYC-compatible (2026-09-13, see three-city-board.mjs's same
+// note) so these jobs still clear location-tier.mjs's classifyGeography gate
+// under the "Actual CareerOps geography policy" -- originally London/Dublin/
+// Berlin, which tested the identical reordering-robustness property; any
+// three distinct real places work for what this fixture tests.
 //
 // No network involved; local-parser reads a JSON array off stdout.
 const ROLE = 'Strategic Finance Manager';
@@ -22,9 +28,9 @@ const COMPANY = 'Fixture Defense';
 const mode = process.env.FIXTURE_RELIST || '';
 
 const job = mode === 'reordered'
-  ? { url: 'https://boards.example.com/fixture/2002', location: 'Dublin, IE | London, UK' }
+  ? { url: 'https://boards.example.com/fixture/2002', location: 'Jersey City, NJ | New York, NY' }
   : mode === 'different'
-    ? { url: 'https://boards.example.com/fixture/2002', location: 'Berlin, DE' }
-    : { url: 'https://boards.example.com/fixture/2001', location: 'London, UK | Dublin, IE' };
+    ? { url: 'https://boards.example.com/fixture/2002', location: 'Stamford, CT' }
+    : { url: 'https://boards.example.com/fixture/2001', location: 'New York, NY | Jersey City, NJ' };
 
 console.log(JSON.stringify([{ title: ROLE, company: COMPANY, ...job }]));

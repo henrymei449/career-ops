@@ -78,6 +78,7 @@ import { promoteKnownFragmentIdentity } from './url-key.mjs';
 import { buildSuppressionIndexFromText } from './discard-suppression.mjs';
 import { runRecallEligibilityChecks } from './post-title-gate.mjs';
 import { appendRecallCandidateIfNew } from './recall-store.mjs';
+import { classifyGeography } from './location-tier.mjs';
 
 try {
   const { config } = await import('dotenv');
@@ -3408,9 +3409,20 @@ async function main() {
           totalFilteredTier++;
           continue;
         }
-        // job.title is passed so a role whose remoteness is stated in the title
-        // ("Program Manager - Remote") isn't rejected for a city-only location.
-        if (!locationFilter(job.location, job.url, job.title)) {
+        // Actual CareerOps geography policy (2026-09-13, location-tier.mjs):
+        // actionable ONLY if REMOTE_US or NYC_COMPATIBLE. classifyGeography()
+        // runs the structured-actor-metadata gate first (stage 1 — currently
+        // only populated for curious_coder/linkedin-jobs-scraper jobs whose
+        // portals.yml entry maps workRemoteAllowed/workplaceTypes; see
+        // plugins/apify/index.mjs's normalizeItem), then — only if that's
+        // genuinely UNKNOWN — the classifyLocation-based fallback (stage 2).
+        // There is no more "confirmed US, lower priority" pass-through: a
+        // still-UNKNOWN final state is treated exactly like REJECT here, so
+        // it can never silently reach the pipeline. This REPLACES the old
+        // location_filter() call at this position (location_filter itself is
+        // untouched and still used by Lane B's runRecallEligibilityChecks).
+        const geography = classifyGeography(job);
+        if (geography.state !== 'REMOTE_US' && geography.state !== 'NYC_COMPATIBLE') {
           totalFilteredLocation++;
           continue;
         }

@@ -316,6 +316,22 @@ export function normalizeItem(item, fieldMap, defaults) {
     const parsed = parsePostedAt(pickField(item, fieldMap.postedAt));
     if (parsed !== undefined) out.postedAt = parsed;
   }
+  // Structured workplace-type metadata (currently only meaningful for
+  // curious_coder/linkedin-jobs-scraper, but generic here like every other
+  // field_map entry) — set ONLY when the raw value is a real, typed signal,
+  // never a fabricated default, so scan.mjs's classifyStructuredWorkplace()
+  // can tell "actor said nothing" (key absent, falls through to the existing
+  // location gate unchanged) apart from "actor said false/empty" (a real,
+  // if unhelpful, signal). Mirrors the postedAt precedent just above.
+  if (fieldMap.workRemoteAllowed) {
+    const raw = pickField(item, fieldMap.workRemoteAllowed);
+    if (typeof raw === 'boolean') out.workRemoteAllowed = raw;
+  }
+  if (fieldMap.workplaceTypes) {
+    const raw = pickField(item, fieldMap.workplaceTypes);
+    if (Array.isArray(raw) && raw.length) out.workplaceTypes = raw.map(v => String(v));
+    else if (typeof raw === 'string' && raw.trim()) out.workplaceTypes = raw.trim();
+  }
   for (const [k, v] of Object.entries(defaults || {})) {
     if (!ALLOWED_DEFAULT_KEYS.has(k)) continue;
     if (!out[k]) out[k] = String(v);
@@ -345,11 +361,13 @@ export default {
         (entry.field_map.company != null && !isFieldSpec(entry.field_map.company)) ||
         (entry.field_map.location != null && !isFieldSpec(entry.field_map.location)) ||
         (entry.field_map.description != null && !isFieldSpec(entry.field_map.description)) ||
-        (entry.field_map.postedAt != null && !isFieldSpec(entry.field_map.postedAt))
+        (entry.field_map.postedAt != null && !isFieldSpec(entry.field_map.postedAt)) ||
+        (entry.field_map.workRemoteAllowed != null && !isFieldSpec(entry.field_map.workRemoteAllowed)) ||
+        (entry.field_map.workplaceTypes != null && !isFieldSpec(entry.field_map.workplaceTypes))
       ) {
         throw new Error(
           `apify: entry ${entry.name} has invalid field_map. Each of title, url, company, ` +
-          `location, description, postedAt must be a string or a non-empty array of strings. title and url are required.`
+          `location, description, postedAt, workRemoteAllowed, workplaceTypes must be a string or a non-empty array of strings. title and url are required.`
         );
       }
 
