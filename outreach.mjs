@@ -57,7 +57,7 @@
  * the reporting mechanism.
  *
  * Usage:
- *   node outreach.mjs applied <job_key> [--outreach required|optional|waived] [--reviewer name]
+ *   node outreach.mjs applied <job_key> [--outreach required|optional|waived] [--reviewer name] [--applied-at ISO date]
  *   node outreach.mjs pass <job_key>
  *   node outreach.mjs decide <job_key> <required|optional|waived>
  *   node outreach.mjs start <job_key>
@@ -140,10 +140,28 @@ async function withJobState(jobKey, mutate, { root = DATA_ROOT } = {}) {
  * is a safe no-op (returns {alreadyApplied: true}) rather than an error, so
  * a retried/duplicate invocation never throws.
  *
+ * `appliedAt` defaults to now (the normal path: a human just submitted the
+ * application). Pass an explicit past ISO date only for a historical
+ * reconciliation (a job confirmed already submitted through some
+ * out-of-band record) — never a future date, which can only be a data-entry
+ * mistake. Either way `outreach` is always set via freshOutreach() (decision
+ * PENDING, status NOT_STARTED), so a historical import never appears as
+ * fresh SEARCH_REQUIRED work — the human resolves the outreach decision
+ * afterward exactly as they would for any other APPLIED job.
+ *
  * @param {string} jobKey
- * @param {{reviewer?: string, root?: string}} [opts]
+ * @param {{reviewer?: string, appliedAt?: string, root?: string}} [opts]
  */
-export async function markApplied(jobKey, { reviewer = null, root = DATA_ROOT } = {}) {
+export async function markApplied(jobKey, { reviewer = null, appliedAt = null, root = DATA_ROOT } = {}) {
+  if (appliedAt != null) {
+    const parsed = new Date(appliedAt);
+    if (Number.isNaN(parsed.getTime())) {
+      throw new Error(`outreach: markApplied appliedAt "${appliedAt}" is not a valid date`);
+    }
+    if (parsed.getTime() > Date.now()) {
+      throw new Error(`outreach: markApplied appliedAt "${appliedAt}" is in the future — refusing`);
+    }
+  }
   return withJobState(jobKey, (job) => {
     if (job.fit_decision !== 'APPLY') {
       throw new Error(`outreach: ${jobKey} has fit_decision=${job.fit_decision}, not APPLY — cannot mark applied`);
@@ -155,7 +173,7 @@ export async function markApplied(jobKey, { reviewer = null, root = DATA_ROOT } 
       throw new Error(`outreach: ${jobKey} has execution_status=${job.execution_status}, not READY_TO_APPLY — cannot mark applied`);
     }
     job.execution_status = 'APPLIED';
-    job.applied_at = new Date().toISOString();
+    job.applied_at = appliedAt ? new Date(appliedAt).toISOString() : new Date().toISOString();
     job.outreach = freshOutreach();
     if (reviewer) job.applied_by = reviewer;
     return { alreadyApplied: false, job: { ...job } };
@@ -391,9 +409,10 @@ async function main() {
 
   if (cmd === 'applied') {
     const jobKey = argv[1];
-    if (!jobKey) { console.error('Usage: node outreach.mjs applied <job_key> [--outreach required|optional|waived]'); process.exitCode = 1; return; }
+    if (!jobKey) { console.error('Usage: node outreach.mjs applied <job_key> [--outreach required|optional|waived] [--applied-at ISO date]'); process.exitCode = 1; return; }
     const reviewer = flagValue(argv, '--reviewer') || null;
-    const { alreadyApplied, job } = await markApplied(jobKey, { reviewer });
+    const appliedAt = flagValue(argv, '--applied-at') || null;
+    const { alreadyApplied, job } = await markApplied(jobKey, { reviewer, appliedAt });
     console.log(alreadyApplied
       ? `${jobKey} is already APPLIED (applied_at: ${job.applied_at}).`
       : `Application marked APPLIED. execution_status=APPLIED, applied_at=${job.applied_at}`);

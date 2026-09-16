@@ -14,6 +14,8 @@ import {
   finalizeBatch,
   ingestFinalizedReviewBatches,
   getJobState,
+  extractJobsToNewBatch,
+  loadOpenBatch,
 } from '../review.mjs';
 import {
   markApplied,
@@ -368,6 +370,117 @@ async function main() {
       if (/fit_decision=INVESTIGATE/.test(err.message)) pass('P6. passOnApplication refuses an INVESTIGATE fit_decision');
       else fail(`P6. passOnApplication threw the wrong error: ${err.message}`);
     }
+  }
+
+  // ── Historical application migration (markApplied appliedAt override) ──
+  // Proves the properties a historical-reconciliation caller needs: the past
+  // date sticks, "now" is never substituted, the result is a normal APPLIED
+  // record with no fresh outreach obligation, it's idempotent, and an
+  // invalid/non-READY target is rejected exactly like the live path.
+
+  // H1. historical appliedAt is preserved verbatim (not "now")
+  {
+    const root = scratchRoot();
+    const jobKey = await setupAppliedReady(root);
+    const historical = '2026-08-26T00:00:00.000Z';
+    const before = Date.now();
+    const { alreadyApplied, job } = await markApplied(jobKey, { root, appliedAt: historical, reviewer: 'migration' });
+    if (!alreadyApplied && job.applied_at === historical && new Date(job.applied_at).getTime() < before) {
+      pass('H1. markApplied(appliedAt) preserves the historical date, not the current timestamp');
+    } else fail(`H1. historical applied_at not preserved: ${JSON.stringify(job)}`);
+  }
+
+  // H2. result is a plain APPLIED record — fit_decision/execution_status correct
+  {
+    const root = scratchRoot();
+    const jobKey = await setupAppliedReady(root);
+    const { job } = await markApplied(jobKey, { root, appliedAt: '2026-09-10T00:00:00.000Z' });
+    if (job.fit_decision === 'APPLY' && job.execution_status === 'APPLIED') {
+      pass('H2. historical markApplied produces fit_decision=APPLY, execution_status=APPLIED');
+    } else fail(`H2. unexpected state: ${JSON.stringify(job)}`);
+  }
+
+  // H3. no fresh outreach obligation — same neutral PENDING/NOT_STARTED as a live apply
+  {
+    const root = scratchRoot();
+    const jobKey = await setupAppliedReady(root);
+    const { job } = await markApplied(jobKey, { root, appliedAt: '2026-09-10T00:00:00.000Z' });
+    if (job.outreach?.decision === 'PENDING' && job.outreach?.status === 'NOT_STARTED') {
+      pass('H3. historical migration never creates a fresh SEARCH_REQUIRED/REQUIRED obligation');
+    } else fail(`H3. historical migration created an unexpected outreach state: ${JSON.stringify(job.outreach)}`);
+    const required = listOutreach({ root, filter: 'required-search' });
+    if (!required.some((e) => e.job_key === jobKey)) pass('H3. historical job does not surface under required-search');
+    else fail('H3. historical job incorrectly surfaced as required-search');
+  }
+
+  // H4. idempotent — re-running with the same historical date is a safe no-op
+  {
+    const root = scratchRoot();
+    const jobKey = await setupAppliedReady(root);
+    const historical = '2026-09-03T00:00:00.000Z';
+    const first = await markApplied(jobKey, { root, appliedAt: historical });
+    const second = await markApplied(jobKey, { root, appliedAt: historical });
+    if (!first.alreadyApplied && second.alreadyApplied && second.job.applied_at === historical) {
+      pass('H4. historical migration is idempotent (repeat call is a safe no-op, date unchanged)');
+    } else fail(`H4. historical migration was not idempotent: ${JSON.stringify({ first, second })}`);
+  }
+
+  // H5. a future date is rejected rather than silently accepted
+  {
+    const root = scratchRoot();
+    const jobKey = await setupAppliedReady(root);
+    const future = new Date(Date.now() + 86400000).toISOString();
+    try {
+      await markApplied(jobKey, { root, appliedAt: future });
+      fail('H5. markApplied should have refused a future appliedAt');
+    } catch (err) {
+      if (/in the future/.test(err.message)) pass('H5. markApplied refuses a future appliedAt');
+      else fail(`H5. markApplied threw the wrong error: ${err.message}`);
+    }
+  }
+
+  // H6. a non-READY target (e.g. PASS decision) is rejected exactly like the live path
+  {
+    const root = scratchRoot();
+    const { batchId, batch } = createBatchFromJobs([{ ...SAMPLE_JOB, url: 'https://boards.greenhouse.io/acme/jobs/2001' }], { root, source: 'test' });
+    const jobKey = batch.jobs[0].job_key;
+    applyProposedDecisions(batchId, {
+      decisions: [{ job_key: jobKey, proposed_decision: 'PASS', reason: 'geography gate', reason_codes: [] }],
+    }, { root });
+    finalizeBatch(batchId, { root });
+    await ingestFinalizedReviewBatches({ root });
+    try {
+      await markApplied(jobKey, { root, appliedAt: '2026-09-10T00:00:00.000Z' });
+      fail('H6. historical markApplied should have refused a PASS-decision job');
+    } catch (err) {
+      if (/fit_decision=PASS/.test(err.message)) pass('H6. historical markApplied refuses a wrong/non-READY migration target');
+      else fail(`H6. historical markApplied threw the wrong error: ${err.message}`);
+    }
+  }
+
+  // H7. extraction removes only the requested job_keys from the source batch
+  {
+    const root = scratchRoot();
+    const jobs = [1, 2, 3].map((n) => ({ ...SAMPLE_JOB, url: `https://boards.greenhouse.io/acme/jobs/300${n}`, title: `Role ${n}` }));
+    const { batchId, batch } = createBatchFromJobs(jobs, { root, source: 'test' });
+    const targetKey = batch.jobs[1].job_key;
+    const otherKeys = [batch.jobs[0].job_key, batch.jobs[2].job_key];
+
+    const result = extractJobsToNewBatch(batchId, [targetKey], { root, source: 'historical-migration' });
+    if (result.extractedCount === 1 && result.remainingCount === 2) {
+      pass('H7. extraction moves exactly the requested count out of the source batch');
+    } else fail(`H7. unexpected extraction counts: ${JSON.stringify(result)}`);
+
+    const sourceAfter = loadOpenBatch(batchId, { root });
+    const remainingKeys = sourceAfter.jobs.map((j) => j.job_key);
+    const untouched = otherKeys.every((k) => remainingKeys.includes(k)) && !remainingKeys.includes(targetKey);
+    if (untouched) pass('H7. extraction leaves every other job_key in the source batch untouched');
+    else fail(`H7. extraction touched an unrelated job_key: ${JSON.stringify(remainingKeys)}`);
+
+    const newBatch = loadOpenBatch(result.newBatchId, { root });
+    if (newBatch.jobs.length === 1 && newBatch.jobs[0].job_key === targetKey) {
+      pass('H7. extracted job lands verbatim in the new batch');
+    } else fail(`H7. new batch did not contain exactly the extracted job: ${JSON.stringify(newBatch)}`);
   }
 }
 
