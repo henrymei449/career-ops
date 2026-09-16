@@ -26,7 +26,9 @@ export const FIT_DECISIONS = ['APPLY', 'INVESTIGATE', 'PASS'];
 
 // execution_status: separate axis from the fit decision. Phase 1 only ever
 // sets READY_TO_APPLY (for a finalized APPLY); everything else is NONE.
-export const EXECUTION_STATUSES = ['NONE', 'READY_TO_APPLY'];
+// APPLIED is added in Pass 2 (outreach.mjs's markApplied) — a human-driven
+// transition out of READY_TO_APPLY, never set by ingestFinalizedReviewBatches.
+export const EXECUTION_STATUSES = ['NONE', 'READY_TO_APPLY', 'APPLIED'];
 
 export const BATCH_STATUSES = ['open', 'finalized', 'processed'];
 

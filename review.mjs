@@ -73,7 +73,11 @@ function ensureDirs(root) {
   return p;
 }
 
-function readJson(filePath, fallback = null) {
+// Exported (not just used internally) so outreach.mjs — which shares this
+// module's durable state file (data/review-state.json) and its lock — reads
+// and writes through the exact same helpers rather than a second copy that
+// could silently diverge from this one's error handling.
+export function readJson(filePath, fallback = null) {
   try {
     return JSON.parse(readFileSync(filePath, 'utf-8'));
   } catch {
@@ -325,7 +329,10 @@ export function finalizeBatch(batchId, { overrides = {}, reviewer = null, root =
   return batch;
 }
 
-function defaultState() {
+// Exported for the same reason as readJson above — outreach.mjs's own
+// read-modify-write of data/review-state.json needs the identical empty
+// shape when the file does not exist yet, not a hand-copied duplicate.
+export function defaultState() {
   return { schema_version: SCHEMA_VERSION, updated_at: null, ingested_batches: {}, jobs: {} };
 }
 
