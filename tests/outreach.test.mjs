@@ -16,7 +16,11 @@ import {
   getJobState,
   extractJobsToNewBatch,
   loadOpenBatch,
+  reviewPaths,
+  readJson,
+  defaultState,
 } from '../review.mjs';
+import { atomicWriteFile } from '../scan.mjs';
 import {
   markApplied,
   passOnApplication,
@@ -264,6 +268,71 @@ async function main() {
     } catch (err) {
       if (/unknown candidate id/.test(err.message)) pass('12. selectContacts rejects an unknown candidate id');
       else fail(`12. selectContacts threw the wrong error: ${err.message}`);
+    }
+  }
+
+  // ── 12b. HOTFIX: a manual/reconciled contact not in the discovered pool
+  // survives selectContacts() re-save alongside a newly-selected discovered
+  // contact — reproduces the IFS "unknown candidate id(s): cand-manual-*"
+  // production defect (Pass 6 reconciled contacts are never part of
+  // outreach.candidates, so selectContacts must not validate them against
+  // that pool). ──
+  {
+    const root = scratchRoot();
+    const jobKey = await setupAppliedReady(root);
+    await markApplied(jobKey, { root });
+    await setOutreachDecision(jobKey, 'REQUIRED', { root });
+    const fakeProvider = async () => [
+      { title: 'Hannah B - Senior Talent Acquisition Partner - Acme Manufacturing | LinkedIn', url: 'https://www.linkedin.com/in/hannahb/', snippet: '' },
+    ];
+    const { candidates } = await discoverContacts(jobKey, { searchProvider: fakeProvider, root });
+    const hannahId = candidates[0].candidate_id;
+
+    // Inject a manual/reconciled contact directly into selected_contacts,
+    // the same way reconcile-live-state.mjs and hand-added manual contacts
+    // (e.g. IFS's real cand-manual-dirkje) do — never through discovery.
+    const manualContact = {
+      candidate_id: 'cand-manual-dirkje', name: 'Dirkje', title: '', company: 'Acme Manufacturing',
+      linkedin_url: '', lane: 'RECRUITING', source: 'MANUAL', score: 0,
+      status: 'CONTACT_SELECTED', channel: 'EMAIL', sent_at: null, replied_at: null,
+      last_action_at: null, next_action: 'SEND_EMAIL', next_action_due: '2026-09-16',
+    };
+    {
+      const p = reviewPaths(root);
+      const state = readJson(p.statePath, defaultState());
+      state.jobs[jobKey].outreach.selected_contacts = [manualContact];
+      state.jobs[jobKey].outreach.status = 'CONTACTS_SELECTED';
+      atomicWriteFile(p.statePath, JSON.stringify(state, null, 2) + '\n');
+    }
+
+    // Save Selected Contacts: Hannah (discovered) + Dirkje (manual, still
+    // checked/selected) — the exact shape the IFS UI screen submits.
+    const outreach = await selectContacts(jobKey, [hannahId, 'cand-manual-dirkje'], { root });
+    const names = outreach.selected_contacts.map((c) => c.name).sort();
+    if (outreach.status === 'CONTACTS_SELECTED' && names.length === 2 && names.includes('Hannah B') && names.includes('Dirkje')) {
+      pass('12b. selectContacts succeeds and preserves both the discovered and the manual/reconciled contact');
+    } else fail(`12b. save did not preserve both contacts: ${JSON.stringify(outreach.selected_contacts)}`);
+
+    const dirkjeAfter = outreach.selected_contacts.find((c) => c.candidate_id === 'cand-manual-dirkje');
+    if (dirkjeAfter && dirkjeAfter.next_action === 'SEND_EMAIL' && dirkjeAfter.channel === 'EMAIL' && dirkjeAfter.next_action_due === '2026-09-16') {
+      pass('12b. the manual contact\'s own status/channel/next_action are preserved verbatim, not reset');
+    } else fail(`12b. manual contact fields were clobbered: ${JSON.stringify(dirkjeAfter)}`);
+
+    // Re-run (idempotent): saving the exact same selection again must not
+    // duplicate or drop either contact.
+    const outreach2 = await selectContacts(jobKey, [hannahId, 'cand-manual-dirkje'], { root });
+    if (outreach2.selected_contacts.length === 2 && JSON.stringify(outreach2.selected_contacts.find((c) => c.candidate_id === 'cand-manual-dirkje')) === JSON.stringify(dirkjeAfter)) {
+      pass('12b. re-saving the same selection is idempotent — no duplicate, Dirkje unchanged');
+    } else fail(`12b. re-save was not idempotent: ${JSON.stringify(outreach2.selected_contacts)}`);
+
+    // A genuinely unknown id (neither pool nor existing selection) still
+    // fails loudly — the fix narrows the exemption, it does not remove it.
+    try {
+      await selectContacts(jobKey, [hannahId, 'cand-totally-unknown'], { root });
+      fail('12b. selectContacts should still reject a genuinely unknown candidate id');
+    } catch (err) {
+      if (/unknown candidate id/.test(err.message)) pass('12b. a genuinely unknown candidate id is still rejected');
+      else fail(`12b. threw the wrong error: ${err.message}`);
     }
   }
 

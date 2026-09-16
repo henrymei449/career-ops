@@ -373,6 +373,16 @@ export async function discoverContacts(jobKey, { searchProvider, root = DATA_ROO
  * outreach.selected_contacts and move to CONTACTS_SELECTED. No hard
  * count requirement (task explicitly says not to require exact counts).
  *
+ * A candidate_id already present in job.outreach.selected_contacts that is
+ * NOT in the discovered outreach.candidates pool (a manually-added contact,
+ * or one added outside discovery entirely — e.g. Pass 6's reconciled sheet
+ * contacts) is preserved verbatim rather than validated against the pool:
+ * it was never discovery output, so "unknown candidate id" is the wrong
+ * failure mode for re-saving a selection that still includes it, and
+ * rebuilding it via freshContactAction() would wipe its real
+ * status/channel/next_action history. Only a genuinely new id that is in
+ * neither the pool nor the existing selection still fails loudly.
+ *
  * @param {string} jobKey
  * @param {string[]} candidateIds
  */
@@ -385,11 +395,18 @@ export async function selectContacts(jobKey, candidateIds, { root = DATA_ROOT } 
       throw new Error(`outreach: ${jobKey} outreach.status=${job.outreach?.status ?? '(none)'} — expected CANDIDATES_FOUND`);
     }
     const byId = new Map(job.outreach.candidates.map((c) => [c.candidate_id, c]));
-    const missing = candidateIds.filter((id) => !byId.has(id));
+    const preservedById = new Map(
+      (job.outreach.selected_contacts || [])
+        .filter((c) => !byId.has(c.candidate_id))
+        .map((c) => [c.candidate_id, c])
+    );
+    const missing = candidateIds.filter((id) => !byId.has(id) && !preservedById.has(id));
     if (missing.length) {
       throw new Error(`outreach: ${jobKey} — unknown candidate id(s): ${missing.join(', ')}`);
     }
-    job.outreach.selected_contacts = candidateIds.map((id) => ({ ...freshContactAction(), ...byId.get(id) }));
+    job.outreach.selected_contacts = candidateIds.map((id) =>
+      byId.has(id) ? { ...freshContactAction(), ...byId.get(id) } : preservedById.get(id)
+    );
     job.outreach.status = 'CONTACTS_SELECTED';
     return { ...job.outreach };
   }, { root });
