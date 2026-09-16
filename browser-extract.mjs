@@ -730,6 +730,66 @@ async function readDom(page) {
   });
 }
 
+/**
+ * Playwright-backed JD capture for any http(s) URL — the same fallback
+ * main()'s jd mode falls through to when fetchJdViaKnownApi() has nothing
+ * (an unknown ATS, or a known one that returned null). Extracted so a
+ * non-CLI caller (e.g. ad-hoc job intake) can reuse the exact same generic
+ * capture path rather than re-implementing a second scraper.
+ *
+ * Same SSRF guards as the CLI path (rejectPrivateOrInvalid on the input, on
+ * every routed request, and on the final URL after redirects) and the same
+ * empty_text floor. Returns `{ error, code }` instead of throwing/exiting so
+ * a caller can fall through to "unresolvable" rather than crash — the same
+ * failure shape emitJd() already writes to stderr for the CLI.
+ *
+ * @param {string} url
+ * @param {{maxChars?: number, timeoutMs?: number}} [opts]
+ * @returns {Promise<{url: string, title: string, text: string} | {error: string, code: string}>}
+ */
+export async function captureJdViaBrowser(url, { maxChars = JD_TEXT_CAP, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  const guard = rejectPrivateOrInvalid(url);
+  if (guard) return { error: guard.reason, code: guard.code };
+
+  let chromium;
+  try {
+    ({ chromium } = await import('playwright'));
+  } catch {
+    return { error: 'playwright not installed', code: 'no_playwright' };
+  }
+
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext(LIVENESS_CONTEXT_OPTIONS);
+    await context.route('**/*', (route) => {
+      if (rejectPrivateOrInvalid(route.request().url())) return route.abort('blockedbyclient');
+      return route.continue();
+    });
+    const page = await context.newPage();
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    await page.waitForTimeout(HYDRATION_WAIT_MS);
+
+    const finalUrl = page.url();
+    const finalGuard = rejectPrivateOrInvalid(finalUrl);
+    if (finalGuard) return { error: `blocked final URL: ${finalGuard.reason}`, code: finalGuard.code };
+
+    const result = normalizeJd(await readDom(page), finalUrl, maxChars);
+    const floor = Math.min(MIN_JD_TEXT_CHARS, maxChars);
+    if (result.text.length < floor) {
+      return {
+        error: `extracted ${result.text.length} chars of JD text (minimum ${floor}) — the page most likely renders its content client-side`,
+        code: 'empty_text',
+      };
+    }
+    return result;
+  } catch (err) {
+    return { error: `navigation error: ${String(err.message).split('\n')[0]}`, code: 'navigation_error' };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
 async function main() {
   const args = process.argv.slice(2);
 

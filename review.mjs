@@ -331,6 +331,36 @@ export function extractJobsToNewBatch(sourceBatchId, jobKeys, { root = DATA_ROOT
   };
 }
 
+/**
+ * Find one job_key inside any open or finalized batch — the per-key lookup
+ * counterpart to collectSeenJobKeys() (which only answers "seen or not").
+ * Used by ad-hoc intake (adhoc-intake.mjs) to report WHICH batch a duplicate
+ * job is already sitting in, so a second paste of the same URL surfaces the
+ * existing batch instead of silently doing nothing or duplicating it.
+ *
+ * processed/ is deliberately not scanned: a processed batch's job is always
+ * also reflected in durable state (data/review-state.json) by construction
+ * (ingestFinalizedReviewBatches writes state before archiving), so a caller
+ * that already checked getJobState() first has no reason to look here too.
+ *
+ * @param {string} jobKey
+ * @param {{root?: string}} [opts]
+ * @returns {{batch_id: string, status: 'open'|'finalized', job: object}|null}
+ */
+export function findBatchedJob(jobKey, { root = DATA_ROOT } = {}) {
+  const p = reviewPaths(root);
+  for (const [dir, status] of [[p.open, 'open'], [p.finalized, 'finalized']]) {
+    if (!existsSync(dir)) continue;
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith('.json')) continue;
+      const batch = readJson(path.join(dir, f), null);
+      const job = batch?.jobs?.find((j) => j.job_key === jobKey);
+      if (job) return { batch_id: batch.batch_id, status, job };
+    }
+  }
+  return null;
+}
+
 /** Load an open batch by id, or null. */
 export function loadOpenBatch(batchId, { root = DATA_ROOT } = {}) {
   const p = reviewPaths(root);

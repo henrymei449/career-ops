@@ -59,6 +59,12 @@
 <main>
   <section id="view-review" class="active">
     <div class="toolbar row">
+      <button class="action" id="add-job-btn">Add Job</button>
+      <input type="url" id="add-job-url" placeholder="https://... job posting URL" style="display:none; flex: 1; min-width: 260px; padding: 6px 10px; border-radius: 4px; border: 1px solid #ccc; font-size: 13px;">
+      <button class="action primary" id="add-job-submit" style="display:none">Intake</button>
+      <span id="add-job-status" class="meta"></span>
+    </div>
+    <div class="toolbar row">
       <label for="batch-select" class="meta">Review Batch:</label>
       <select id="batch-select"></select>
     </div>

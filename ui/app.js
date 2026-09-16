@@ -70,6 +70,57 @@ $('#batch-select').addEventListener('change', (ev) => {
   loadReview();
 });
 
+// ── Ad-hoc job intake (#pass3): paste a URL, get a scoped ad_hoc review
+//    batch through the exact same POST /api/intake -> adhoc-intake.mjs path
+//    every other batch is built through server-side. No CLI, no JSON typed
+//    by the operator — the human experience is paste URL -> click Intake ->
+//    the Review batch selector jumps to the new batch.
+const addJobBtn = $('#add-job-btn');
+const addJobUrl = $('#add-job-url');
+const addJobSubmit = $('#add-job-submit');
+const addJobStatus = $('#add-job-status');
+
+addJobBtn.addEventListener('click', () => {
+  const showing = addJobUrl.style.display !== 'none';
+  addJobUrl.style.display = showing ? 'none' : '';
+  addJobSubmit.style.display = showing ? 'none' : '';
+  addJobStatus.textContent = '';
+  if (!showing) addJobUrl.focus();
+});
+
+async function submitAddJob() {
+  const url = addJobUrl.value.trim();
+  if (!url) { addJobStatus.textContent = 'Paste a job URL first.'; return; }
+  addJobSubmit.disabled = true;
+  addJobStatus.textContent = 'Capturing…';
+  try {
+    const result = await api('POST', '/api/intake', { url });
+    if (result.outcome === 'created') {
+      addJobStatus.textContent = `Added: ${result.job.company || '(company unknown)'} — ${result.job.title || '(title unknown)'}`;
+      addJobUrl.value = '';
+      addJobUrl.style.display = 'none';
+      addJobSubmit.style.display = 'none';
+      state.selectedBatchId = result.batch_id;
+      loadReview();
+    } else if (result.outcome === 'existing') {
+      const where = result.batch_id ? ` (batch ${result.batch_id})` : '';
+      addJobStatus.textContent = `Already known — ${result.state}${where}: ${result.summary.company || '?'} — ${result.summary.title || '?'}`;
+      if (result.batch_id) { state.selectedBatchId = result.batch_id; loadReview(); }
+    } else if (result.outcome === 'unsupported') {
+      addJobStatus.textContent = `Could not capture this posting: ${result.reason}`;
+    } else {
+      addJobStatus.textContent = result.error || 'Intake failed.';
+    }
+  } catch (e) {
+    addJobStatus.textContent = e.message;
+  } finally {
+    addJobSubmit.disabled = false;
+  }
+}
+
+addJobSubmit.addEventListener('click', submitAddJob);
+addJobUrl.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submitAddJob(); });
+
 // ── Review (batch-aware: exactly one open batch is shown/decided/finalized
 //    at a time — see docs/careerops-state-model.md's batch-scoping note) ──
 

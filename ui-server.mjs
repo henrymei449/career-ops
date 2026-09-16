@@ -43,6 +43,7 @@ import {
   listOutreach,
   resolveSearchProvider,
 } from './outreach.mjs';
+import { intakeJob } from './adhoc-intake.mjs';
 
 const DATA_ROOT = getCareerOpsRoot();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -313,6 +314,16 @@ const API_ROUTES = [
   // Follow-up workflow is not implemented (docs/careerops-state-model.md) —
   // this queue is read-only/empty by design, never a source of invented state.
   ['GET', '/api/followup', async () => ({ jobs: [] })],
+  // Ad-hoc job intake (#pass3): paste-a-URL entry point into the SAME
+  // review-batch pipeline every sourced job goes through. All capture/
+  // dedupe/batch logic lives in adhoc-intake.mjs — this route only forwards
+  // the URL and shapes the response, same thin-adapter pattern as every
+  // other route above.
+  ['POST', '/api/intake', async (body) => {
+    const { url } = body;
+    if (!url) throw new Error('url required');
+    return intakeJob(url, { root: DATA_ROOT });
+  }],
 ];
 
 function matchRoute(method, urlPath) {
