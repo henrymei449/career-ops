@@ -157,18 +157,12 @@ export function createBatchFromJobs(jobs, { root = DATA_ROOT, source = 'manual',
 }
 
 /**
- * Build an UNREVIEWED review batch from data/pipeline.md's Pending section —
- * the existing canonical sourcing-survivor artifact. Only entries whose
- * job_key has never been batched before (open, finalized, processed, or
- * already in durable state) are included, so re-running this after a scan
- * only picks up genuinely new survivors.
+ * Every job_key already batched anywhere — open, finalized, processed, or
+ * durable state. Shared by createBatchFromPipelinePending() (a full sweep)
+ * and createBatchFromUrls() (a scoped pull) so "already batched" has exactly
+ * one definition, computed once, not two copies that could drift.
  */
-export function createBatchFromPipelinePending({ root = DATA_ROOT, limit = Infinity, pipelinePath } = {}) {
-  const p = ensureDirs(root);
-  const pipeline = pipelinePath || path.join(root, 'data', 'pipeline.md');
-  if (!existsSync(pipeline)) return { batchId: null, filePath: null, batch: null, skipped: [] };
-  const entries = parsePipelinePendingEntries(readFileSync(pipeline, 'utf-8'));
-
+function collectSeenJobKeys(p) {
   const seen = new Set();
   const state = readJson(p.statePath, null);
   if (state?.jobs) for (const k of Object.keys(state.jobs)) seen.add(k);
@@ -180,6 +174,22 @@ export function createBatchFromPipelinePending({ root = DATA_ROOT, limit = Infin
       for (const j of b?.jobs || []) if (j.job_key) seen.add(j.job_key);
     }
   }
+  return seen;
+}
+
+/**
+ * Build an UNREVIEWED review batch from data/pipeline.md's Pending section —
+ * the existing canonical sourcing-survivor artifact. Only entries whose
+ * job_key has never been batched before (open, finalized, processed, or
+ * already in durable state) are included, so re-running this after a scan
+ * only picks up genuinely new survivors.
+ */
+export function createBatchFromPipelinePending({ root = DATA_ROOT, limit = Infinity, pipelinePath } = {}) {
+  const p = ensureDirs(root);
+  const pipeline = pipelinePath || path.join(root, 'data', 'pipeline.md');
+  if (!existsSync(pipeline)) return { batchId: null, filePath: null, batch: null, skipped: [] };
+  const entries = parsePipelinePendingEntries(readFileSync(pipeline, 'utf-8'));
+  const seen = collectSeenJobKeys(p);
 
   const fresh = [];
   for (const entry of entries) {
@@ -191,6 +201,134 @@ export function createBatchFromPipelinePending({ root = DATA_ROOT, limit = Infin
   }
   if (fresh.length === 0) return { batchId: null, filePath: null, batch: null, skipped: [] };
   return createBatchFromJobs(fresh, { root, source: 'pipeline.md' });
+}
+
+/**
+ * Build an UNREVIEWED review batch containing ONLY the pipeline.md Pending
+ * entries whose URL is in `urls` — the scoped counterpart to
+ * createBatchFromPipelinePending()'s full-backlog sweep. For a cohort run
+ * (or any other caller) that already knows its exact survivor URLs (e.g. a
+ * scan receipt's `added_urls`) and wants a review batch containing exactly
+ * those jobs and nothing else — no sweep of unrelated Pending rows, no
+ * reconstruction of job records from anything but the same
+ * parsePipelinePendingEntries() parse every other batch-creation path uses.
+ *
+ * Same "already batched anywhere" dedup guarantee as the full sweep
+ * (collectSeenJobKeys) — a URL that's somehow already in an open/finalized/
+ * processed batch or durable state is silently skipped rather than
+ * duplicated, and reported in `skippedAlreadyBatched` so a caller can tell
+ * "not found in Pending" from "found but already batched."
+ *
+ * @param {string[]} urls - exact posting URLs to pull out of Pending.
+ * @param {{root?: string, pipelinePath?: string, source?: string}} [opts]
+ * @returns {{batchId: string|null, filePath: string|null, batch: object|null, skipped: object[], skippedAlreadyBatched: object[], notFound: string[]}}
+ */
+export function createBatchFromUrls(urls, { root = DATA_ROOT, pipelinePath, source = 'cohort' } = {}) {
+  const p = ensureDirs(root);
+  const pipeline = pipelinePath || path.join(root, 'data', 'pipeline.md');
+  const wanted = new Set((urls || []).filter(Boolean));
+  if (wanted.size === 0) return { batchId: null, filePath: null, batch: null, skipped: [], skippedAlreadyBatched: [], notFound: [] };
+  if (!existsSync(pipeline)) return { batchId: null, filePath: null, batch: null, skipped: [], skippedAlreadyBatched: [], notFound: [...wanted] };
+
+  const entries = parsePipelinePendingEntries(readFileSync(pipeline, 'utf-8'));
+  const byUrl = new Map(entries.map((e) => [e.url, e]));
+  const seen = collectSeenJobKeys(p);
+
+  const fresh = [];
+  const skippedAlreadyBatched = [];
+  const notFound = [];
+  for (const url of wanted) {
+    const entry = byUrl.get(url);
+    if (!entry) { notFound.push(url); continue; }
+    const key = computeJobKey(entry);
+    if (!key || seen.has(key)) { skippedAlreadyBatched.push(entry); continue; }
+    seen.add(key);
+    fresh.push(entry);
+  }
+  if (fresh.length === 0) return { batchId: null, filePath: null, batch: null, skipped: [], skippedAlreadyBatched, notFound };
+  const result = createBatchFromJobs(fresh, { root, source });
+  return { ...result, skippedAlreadyBatched, notFound };
+}
+
+/**
+ * Move specific already-built job records out of one open batch and into a
+ * brand-new one — a controlled correction for a job that landed in the
+ * wrong-scoped batch (e.g. an unscoped sweep that pulled a cohort survivor
+ * into a large historical-backlog batch alongside it), NOT a general
+ * batch-editing primitive. Deliberately narrow:
+ *
+ *   - Only UNREVIEWED jobs with no final_decision may be extracted — moving
+ *     a job that already carries a human decision would separate that
+ *     decision from an audit trail explaining it, so this refuses rather
+ *     than silently carrying (or dropping) it.
+ *   - The job records themselves are relocated VERBATIM (same job_key, same
+ *     already-computed `gates`/`jd` fields) — never rebuilt via
+ *     buildJobRecord()/buildBatch(), so there is no risk of the move itself
+ *     silently changing a gate result a second computation might resolve
+ *     differently (e.g. a time-sensitive geography read).
+ *   - Failure-mode-aware ordering: the NEW batch is written first. If the
+ *     source-batch rewrite below then fails, the job_key exists in two open
+ *     batches (a detectable, fixable duplicate) rather than in neither (an
+ *     unrecoverable loss). The reverse order would risk the opposite.
+ *
+ * @param {string} sourceBatchId - batch to remove jobs from.
+ * @param {string[]} jobKeys - exact job_key values to move (must all exist
+ *   in the source batch and be UNREVIEWED/undecided).
+ * @param {{root?: string, source?: string, batchId?: string}} [opts]
+ * @returns {{newBatchId: string, newFilePath: string, newBatch: object, sourceBatchId: string, sourceFilePath: string, extractedCount: number, remainingCount: number}}
+ */
+export function extractJobsToNewBatch(sourceBatchId, jobKeys, { root = DATA_ROOT, source = 'cohort', batchId } = {}) {
+  const p = ensureDirs(root);
+  const sourcePath = path.join(p.open, `${sourceBatchId}.json`);
+  const sourceBatch = readJson(sourcePath, null);
+  if (!sourceBatch) throw new Error(`extractJobsToNewBatch: no open batch ${sourceBatchId}`);
+
+  const wanted = new Set(jobKeys);
+  const extracted = [];
+  const remaining = [];
+  for (const job of sourceBatch.jobs) {
+    if (wanted.has(job.job_key)) extracted.push(job);
+    else remaining.push(job);
+  }
+  const missing = [...wanted].filter((k) => !extracted.some((j) => j.job_key === k));
+  if (missing.length) {
+    throw new Error(`extractJobsToNewBatch: job_key(s) not found in ${sourceBatchId}: ${missing.join(', ')}`);
+  }
+  const alreadyDecided = extracted.filter((j) => j.review.status !== 'UNREVIEWED' || j.review.final_decision !== null || j.review.proposed_decision !== null);
+  if (alreadyDecided.length) {
+    throw new Error(`extractJobsToNewBatch: refusing to move already-reviewed job(s): ${alreadyDecided.map((j) => j.job_key).join(', ')}`);
+  }
+
+  const newId = batchId || nextBatchId(root);
+  const newBatch = {
+    schema_version: SCHEMA_VERSION,
+    batch_id: newId,
+    created_at: new Date().toISOString(),
+    status: 'open',
+    source,
+    jobs: extracted,
+  };
+  const newErrors = validateBatch(newBatch, 'open');
+  if (newErrors.length) throw new Error(`extractJobsToNewBatch: constructed new batch is invalid: ${newErrors.join('; ')}`);
+
+  const updatedSource = { ...sourceBatch, jobs: remaining };
+  const sourceErrors = validateBatch(updatedSource, 'open');
+  if (sourceErrors.length) throw new Error(`extractJobsToNewBatch: source batch would become invalid after removal: ${sourceErrors.join('; ')}`);
+
+  // New batch first — see the ordering note above.
+  const newFilePath = path.join(p.open, `${newId}.json`);
+  atomicWriteFile(newFilePath, JSON.stringify(newBatch, null, 2) + '\n');
+  atomicWriteFile(sourcePath, JSON.stringify(updatedSource, null, 2) + '\n');
+
+  return {
+    newBatchId: newId,
+    newFilePath,
+    newBatch,
+    sourceBatchId,
+    sourceFilePath: sourcePath,
+    extractedCount: extracted.length,
+    remainingCount: remaining.length,
+  };
 }
 
 /** Load an open batch by id, or null. */

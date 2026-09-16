@@ -49,30 +49,62 @@ const PUBLIC_DIR = path.join(__dirname, 'ui');
 
 // ── Read helpers (pure reads over existing storage — no new state) ─────────
 
-/** Every open review batch, each job_key already tagged with its batch_id. */
-function listOpenReviewJobs() {
-  const p = reviewPaths(DATA_ROOT);
+/** Every open batch file, parsed, newest (by created_at) first. */
+export function readOpenBatches(root = DATA_ROOT) {
+  const p = reviewPaths(root);
   if (!existsSync(p.open)) return [];
   const files = readdirSync(p.open).filter((f) => f.endsWith('.json'));
-  const out = [];
+  const batches = [];
   for (const file of files) {
     const batch = readJson(path.join(p.open, file), null);
-    if (!batch) continue;
-    for (const job of batch.jobs) {
-      out.push({
-        batch_id: batch.batch_id,
-        job_key: job.job_key,
-        company: job.company,
-        title: job.title,
-        location: job.location || '',
-        url: job.url || '',
-        proposed_decision: job.review.proposed_decision,
-        reason: job.review.reason || '',
-        final_decision: job.review.final_decision,
-      });
-    }
+    if (batch) batches.push(batch);
   }
-  return out;
+  batches.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+  return batches;
+}
+
+/**
+ * One row per open batch — id, created_at, job count, source/provenance —
+ * for the UI's batch selector. `source` is whatever createBatchFromJobs()
+ * was called with ('cohort', 'pipeline.md', 'manual', ...); never invented
+ * here, never defaulted to a human-friendly label the batch itself doesn't
+ * carry.
+ */
+export function listOpenBatchSummaries(root = DATA_ROOT) {
+  return readOpenBatches(root).map((batch) => ({
+    batch_id: batch.batch_id,
+    created_at: batch.created_at,
+    count: batch.jobs.length,
+    source: batch.source || '',
+  }));
+}
+
+/**
+ * Jobs for ONE open batch — the batch-aware replacement for the old
+ * all-batches-flattened read. `batchId` omitted (or not found) defaults to
+ * the newest open batch (readOpenBatches() is already newest-first), so a
+ * freshly created cohort batch is what the UI opens to by default. Returns
+ * null when there are no open batches at all.
+ */
+export function listReviewJobsForBatch(batchId, root = DATA_ROOT) {
+  const batches = readOpenBatches(root);
+  if (batches.length === 0) return null;
+  const batch = batchId ? batches.find((b) => b.batch_id === batchId) : batches[0];
+  if (!batch) return null;
+  return {
+    batch_id: batch.batch_id,
+    jobs: batch.jobs.map((job) => ({
+      batch_id: batch.batch_id,
+      job_key: job.job_key,
+      company: job.company,
+      title: job.title,
+      location: job.location || '',
+      url: job.url || '',
+      proposed_decision: job.review.proposed_decision,
+      reason: job.review.reason || '',
+      final_decision: job.review.final_decision,
+    })),
+  };
 }
 
 /** Durable jobs with fit_decision=APPLY, execution_status=READY_TO_APPLY. */
@@ -140,7 +172,11 @@ function serveStatic(req, res, urlPath) {
 }
 
 const API_ROUTES = [
-  ['GET', '/api/review', async () => ({ jobs: listOpenReviewJobs() })],
+  ['GET', '/api/review/batches', async () => ({ batches: listOpenBatchSummaries() })],
+  ['GET', '/api/review', async (body, query) => {
+    const result = listReviewJobsForBatch(query.get('batch_id'));
+    return result || { batch_id: null, jobs: [] };
+  }],
   ['POST', '/api/review/finalize', async (body) => {
     const { batch_id: batchId, overrides = {}, reviewer } = body;
     if (!batchId) throw new Error('batch_id required');
@@ -196,12 +232,12 @@ function matchRoute(method, urlPath) {
   return API_ROUTES.find(([m, p]) => m === method && p === urlPath);
 }
 
-async function handleApi(req, res, urlPath) {
+async function handleApi(req, res, urlPath, query) {
   const route = matchRoute(req.method, urlPath);
   if (!route) { sendJson(res, 404, { error: `no route ${req.method} ${urlPath}` }); return; }
   try {
     const body = req.method === 'POST' ? await readBody(req) : {};
-    const result = await route[2](body);
+    const result = await route[2](body, query);
     sendJson(res, 200, result);
   } catch (err) {
     sendJson(res, 400, { error: err.message });
@@ -211,9 +247,9 @@ async function handleApi(req, res, urlPath) {
 function main() {
   const port = Number(flagValue(process.argv.slice(2), '--port')) || 5173;
   const server = createServer((req, res) => {
-    const urlPath = new URL(req.url, 'http://localhost').pathname;
-    if (urlPath.startsWith('/api/')) { handleApi(req, res, urlPath); return; }
-    serveStatic(req, res, urlPath);
+    const url = new URL(req.url, 'http://localhost');
+    if (url.pathname.startsWith('/api/')) { handleApi(req, res, url.pathname, url.searchParams); return; }
+    serveStatic(req, res, url.pathname);
   });
   server.listen(port, () => {
     console.log(`CareerOps operator UI: http://localhost:${port}  (data root: ${DATA_ROOT})`);

@@ -15,8 +15,11 @@ import { companyRoleDedupKey } from '../scan.mjs';
 import { computeJobKey, buildBatch, validateBatch, FIT_DECISIONS } from '../review-schema.mjs';
 import {
   reviewPaths,
+  readJson,
   createBatchFromJobs,
   createBatchFromPipelinePending,
+  createBatchFromUrls,
+  extractJobsToNewBatch,
   loadOpenBatch,
   applyProposedDecisions,
   validateReviewedOutput,
@@ -257,6 +260,122 @@ async function main() {
     if (doctorSweep.ingested.length === 0 && stateFileBefore === stateFileAfter) {
       pass('11. a subsequent doctor.mjs-style ingestion sweep is a harmless no-op (UI/service path is not doctor-dependent)');
     } else fail(`11. subsequent ingestion sweep was not a no-op: ${JSON.stringify(doctorSweep)}`);
+  }
+
+  // ── 12. createBatchFromUrls() — scoped batch creation (cohort survivors) ──
+  {
+    const root = scratchRoot();
+    mkdirSync(join(root, 'data'), { recursive: true });
+    const pipelinePath = join(root, 'data', 'pipeline.md');
+    // A realistic Pending section: a large pre-existing backlog PLUS the two
+    // "cohort survivor" rows we actually want — mirrors the real production
+    // shape (390-ish backlog rows sitting alongside 2 fresh cohort rows).
+    const backlogRows = Array.from({ length: 12 }, (_, i) =>
+      `- [ ] https://boards.greenhouse.io/acme/jobs/backlog-${i} | BacklogCo | Backlog Role ${i} | Remote - United States`);
+    const cohortJobA = { url: 'https://jobs.smartrecruiters.com/ifs1/cohort-a', company: 'IFS', title: 'Forward Deployed AI Engineer', location: 'Itasca, IL, Remote' };
+    const cohortJobB = { url: 'https://jobs.smartrecruiters.com/ifs1/cohort-b', company: 'IFS', title: 'Customer Success Manager', location: 'Itasca, IL, Remote' };
+    const cohortRows = [cohortJobA, cohortJobB].map((j) => `- [ ] ${j.url} | ${j.company} | ${j.title} | ${j.location}`);
+    writeFileSync(pipelinePath, `# Pipeline\n\n## Pending\n\n${backlogRows.join('\n')}\n${cohortRows.join('\n')}\n\n## Processed\n`);
+
+    const result = createBatchFromUrls([cohortJobA.url, cohortJobB.url], { root, pipelinePath, source: 'cohort' });
+    if (result.batchId && result.batch.jobs.length === 2) {
+      pass('12. scoped batch creation includes exactly the requested jobs (2, not the 12-row backlog)');
+    } else fail(`12. scoped batch had wrong membership: ${JSON.stringify(result.batch?.jobs?.length)}`);
+
+    const titles = result.batch.jobs.map((j) => j.title).sort();
+    if (titles.includes('Forward Deployed AI Engineer') && titles.includes('Customer Success Manager')) {
+      pass('12. scoped batch contains the exact two requested titles');
+    } else fail(`12. scoped batch had wrong titles: ${JSON.stringify(titles)}`);
+
+    if (result.batch.source === 'cohort') pass('12. scoped batch records source=cohort');
+    else fail(`12. scoped batch source was not recorded: ${result.batch.source}`);
+
+    // The backlog rows must never have been touched/batched by this call.
+    const p = reviewPaths(root);
+    const openFiles = readdirSync(p.open);
+    let backlogBatched = false;
+    for (const f of openFiles) {
+      const b = readJson(join(p.open, f), null);
+      if (b?.jobs?.some((j) => j.company === 'BacklogCo')) backlogBatched = true;
+    }
+    if (!backlogBatched) pass('12. scoped batch creation does not sweep the unrelated Pending backlog');
+    else fail('12. scoped batch creation swept backlog rows it should not have touched');
+
+    // Re-running with the same URLs after the batch exists: already-batched,
+    // reported distinctly, not silently duplicated into a second batch.
+    const second = createBatchFromUrls([cohortJobA.url, cohortJobB.url], { root, pipelinePath, source: 'cohort' });
+    if (second.batchId === null && second.skippedAlreadyBatched.length === 2) {
+      pass('12. re-running on already-batched URLs creates no duplicate batch and reports them as already-batched');
+    } else fail(`12. re-run did not correctly detect already-batched URLs: ${JSON.stringify(second)}`);
+
+    // A URL not present in Pending at all is reported, not silently dropped.
+    const notFoundResult = createBatchFromUrls(['https://example.com/not-in-pipeline'], { root, pipelinePath });
+    if (notFoundResult.batchId === null && notFoundResult.notFound.includes('https://example.com/not-in-pipeline')) {
+      pass('12. a URL absent from Pending is reported in notFound, not silently ignored');
+    } else fail(`12. notFound reporting broken: ${JSON.stringify(notFoundResult)}`);
+  }
+
+  // ── 13. extractJobsToNewBatch() — controlled correction for a job stuck ──
+  //       in the wrong-scoped batch (the batch-20260916-0006 real scenario)
+  {
+    const root = scratchRoot();
+    const bigJob1 = { url: 'https://boards.greenhouse.io/acme/jobs/big-1', company: 'BacklogCo', title: 'Backlog Role 1' };
+    const bigJob2 = { url: 'https://boards.greenhouse.io/acme/jobs/big-2', company: 'BacklogCo', title: 'Backlog Role 2' };
+    const survivorA = { url: 'https://jobs.smartrecruiters.com/ifs1/extract-a', company: 'IFS', title: 'Forward Deployed AI Engineer' };
+    const survivorB = { url: 'https://jobs.smartrecruiters.com/ifs1/extract-b', company: 'IFS', title: 'Customer Success Manager' };
+    const { batchId: bigBatchId, batch: bigBatch } = createBatchFromJobs([bigJob1, survivorA, survivorB, bigJob2], { root, source: 'pipeline.md' });
+    const [k1, kA, kB, k2] = bigBatch.jobs.map((j) => j.job_key);
+
+    const result = extractJobsToNewBatch(bigBatchId, [kA, kB], { root, source: 'cohort' });
+    if (result.extractedCount === 2 && result.remainingCount === 2) {
+      pass('13. extraction moves exactly the requested 2 jobs, leaving the other 2 in place');
+    } else fail(`13. extraction counts wrong: ${JSON.stringify(result)}`);
+
+    const newBatch = loadOpenBatch(result.newBatchId, { root });
+    const newKeys = newBatch.jobs.map((j) => j.job_key).sort();
+    if (JSON.stringify(newKeys) === JSON.stringify([kA, kB].sort())) {
+      pass('13. new batch contains exactly the extracted job_keys, nothing else');
+    } else fail(`13. new batch membership wrong: ${JSON.stringify(newKeys)}`);
+    if (newBatch.source === 'cohort') pass('13. new batch records the given source');
+    else fail(`13. new batch source wrong: ${newBatch.source}`);
+
+    const sourceAfter = loadOpenBatch(bigBatchId, { root });
+    const sourceKeys = sourceAfter.jobs.map((j) => j.job_key).sort();
+    if (JSON.stringify(sourceKeys) === JSON.stringify([k1, k2].sort())) {
+      pass('13. source batch retains exactly the 2 non-extracted jobs after removal');
+    } else fail(`13. source batch membership wrong after extraction: ${JSON.stringify(sourceKeys)}`);
+    if (sourceAfter.batch_id === bigBatchId) pass('13. source batch keeps its original batch_id (not recreated)');
+    else fail('13. source batch_id changed unexpectedly');
+
+    // Verbatim relocation: job_key and gates are untouched, not recomputed.
+    const originalA = bigBatch.jobs.find((j) => j.job_key === kA);
+    const movedA = newBatch.jobs.find((j) => j.job_key === kA);
+    if (JSON.stringify(movedA.gates) === JSON.stringify(originalA.gates) && movedA.job_key === originalA.job_key) {
+      pass('13. moved job record is relocated verbatim (job_key and gates unchanged, not recomputed)');
+    } else fail('13. moved job record diverged from its original');
+
+    // No job_key exists in both batches simultaneously.
+    const overlap = sourceKeys.filter((k) => newKeys.includes(k));
+    if (overlap.length === 0) pass('13. no job_key appears in both the source and new batch (no duplicate)');
+    else fail(`13. duplicate job_key(s) across batches: ${overlap}`);
+
+    // Refuses to extract an already-decided job.
+    const root2 = scratchRoot();
+    const decidedJob = { url: 'https://boards.greenhouse.io/acme/jobs/decided-1', company: 'Acme', title: 'Decided Role' };
+    const { batchId: decidedBatchId, batch: decidedBatch } = createBatchFromJobs([decidedJob], { root: root2, source: 'test' });
+    applyProposedDecisions(decidedBatchId, { decisions: [{ job_key: decidedBatch.jobs[0].job_key, proposed_decision: 'APPLY', reason: 'test' }] }, { root: root2 });
+    let threw = false;
+    try { extractJobsToNewBatch(decidedBatchId, [decidedBatch.jobs[0].job_key], { root: root2 }); }
+    catch { threw = true; }
+    if (threw) pass('13. extraction refuses a job that already has a proposed_decision');
+    else fail('13. extraction allowed moving an already-reviewed job');
+
+    // Refuses an unknown job_key.
+    let threwMissing = false;
+    try { extractJobsToNewBatch(bigBatchId, ['url:not-in-this-batch'], { root }); }
+    catch { threwMissing = true; }
+    if (threwMissing) pass('13. extraction refuses an unknown job_key');
+    else fail('13. extraction silently ignored an unknown job_key');
   }
 
   // ── 10. existing stable job identity is reused ─────────────────────────

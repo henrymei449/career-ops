@@ -8,6 +8,7 @@ const state = {
   view: 'review',
   reviewSelections: {}, // job_key -> 'APPLY' | 'INVESTIGATE' | 'PASS'
   outreachSelections: {}, // job_key -> Set(candidate_id)
+  selectedBatchId: null, // Review tab's currently selected open batch
 };
 
 function $(sel, root = document) { return root.querySelector(sel); }
@@ -59,18 +60,68 @@ function loadView(view) {
 
 $all('nav button').forEach((b) => b.addEventListener('click', () => setView(b.dataset.view)));
 
-// ── Review ───────────────────────────────────────────────────────────────
+// Bound once — the <select> element itself persists across loadReview()
+// calls (only its <option> children are replaced), so this must not be
+// re-attached on every load or clicks would fire the handler multiple times.
+$('#batch-select').addEventListener('change', (ev) => {
+  state.selectedBatchId = ev.target.value || null;
+  loadReview();
+});
+
+// ── Review (batch-aware: exactly one open batch is shown/decided/finalized
+//    at a time — see docs/careerops-state-model.md's batch-scoping note) ──
+
+function formatBatchLabel(b) {
+  const when = b.created_at ? new Date(b.created_at).toLocaleString() : '(unknown time)';
+  const src = b.source ? ` — ${b.source}` : '';
+  return `${b.batch_id} — ${b.count} job${b.count === 1 ? '' : 's'}${src} — ${when}`;
+}
+
+async function loadBatchSelector() {
+  const select = $('#batch-select');
+  let data;
+  try { data = await api('GET', '/api/review/batches'); }
+  catch (e) { showError($('#review-list'), e.message); return []; }
+
+  const batches = data.batches; // newest-first, per the server's own sort
+  select.innerHTML = '';
+  if (batches.length === 0) {
+    select.appendChild(el('option', { value: '', text: '(no open batches)' }));
+    select.disabled = true;
+    return batches;
+  }
+  select.disabled = false;
+  for (const b of batches) {
+    select.appendChild(el('option', { value: b.batch_id, text: formatBatchLabel(b) }));
+  }
+  // Default: newest open batch (batches[0]) — unless the previously selected
+  // batch still exists (e.g. a reload after switching), in which case stay
+  // on it rather than snapping back to newest under the user.
+  const stillOpen = state.selectedBatchId && batches.some((b) => b.batch_id === state.selectedBatchId);
+  state.selectedBatchId = stillOpen ? state.selectedBatchId : batches[0].batch_id;
+  select.value = state.selectedBatchId;
+  return batches;
+}
 
 async function loadReview() {
   const listEl = $('#review-list');
   listEl.innerHTML = '<p class="empty">Loading…</p>';
+  await loadBatchSelector();
+
+  if (!state.selectedBatchId) {
+    listEl.innerHTML = '';
+    listEl.appendChild(el('p', { class: 'empty', text: 'No open review batches.' }));
+    updateFinalizeButton(null, []);
+    return;
+  }
+
   let data;
-  try { data = await api('GET', '/api/review'); }
+  try { data = await api('GET', `/api/review?batch_id=${encodeURIComponent(state.selectedBatchId)}`); }
   catch (e) { listEl.innerHTML = ''; showError(listEl, e.message); return; }
 
   const jobs = data.jobs;
   listEl.innerHTML = '';
-  if (jobs.length === 0) { listEl.appendChild(el('p', { class: 'empty', text: 'No jobs pending review.' })); updateFinalizeButton([]); return; }
+  if (jobs.length === 0) { listEl.appendChild(el('p', { class: 'empty', text: 'This batch has no jobs.' })); updateFinalizeButton(data.batch_id, []); return; }
 
   for (const job of jobs) {
     if (!(job.job_key in state.reviewSelections) && job.proposed_decision) {
@@ -78,7 +129,7 @@ async function loadReview() {
     }
     listEl.appendChild(renderReviewCard(job));
   }
-  updateFinalizeButton(jobs);
+  updateFinalizeButton(data.batch_id, jobs);
 }
 
 function renderReviewCard(job) {
@@ -111,30 +162,31 @@ function renderReviewCard(job) {
   return card;
 }
 
-function updateFinalizeButton(jobs) {
+// `jobs` here is ALWAYS the selected batch's own job list (server-side
+// /api/review is already scoped to one batch_id) — so decisions/overrides
+// built from it can never cross into another batch by construction, even
+// though state.reviewSelections is one flat job_key-keyed dict (job_keys are
+// globally unique, so no two batches can ever share one anyway).
+function updateFinalizeButton(batchId, jobs) {
   const btn = $('#finalize-btn');
   const hint = $('#finalize-hint');
-  if (jobs.length === 0) { btn.disabled = true; hint.textContent = ''; btn.onclick = null; return; }
-  const batchId = jobs[0].batch_id;
-  const sameBatch = jobs.every((j) => j.batch_id === batchId);
+  if (!batchId || jobs.length === 0) { btn.disabled = true; hint.textContent = ''; btn.onclick = null; return; }
   const allDecided = jobs.every((j) => state.reviewSelections[j.job_key]);
-  btn.disabled = !(sameBatch && allDecided);
-  hint.textContent = sameBatch
-    ? (allDecided ? `Ready — batch ${batchId}` : 'Decide every job to enable finalize')
-    : 'Multiple open batches — finalize one at a time (not supported by this view yet)';
+  btn.disabled = !allDecided;
+  hint.textContent = allDecided ? `Ready — batch ${batchId}` : 'Decide every job in this batch to enable finalize';
   btn.onclick = async () => {
-    if (!sameBatch) return;
     const overrides = {};
     for (const j of jobs) overrides[j.job_key] = state.reviewSelections[j.job_key];
     try {
       const result = await api('POST', '/api/review/finalize', { batch_id: batchId, overrides });
-      state.reviewSelections = {};
+      for (const j of jobs) delete state.reviewSelections[j.job_key];
       if (!result.ingested) {
         // finalizeAndIngestBatch() finalized the batch but the durable-state
         // ingestion pass did not report it as ingested — surface loudly
         // rather than silently leaving Ready to Apply stale.
         showError($('#review-list'), `Batch finalized but not yet reflected in durable state: ${JSON.stringify(result.ingestion_errors)}`);
       }
+      state.selectedBatchId = null; // batch is gone — let loadReview() re-pick the new newest
       loadReview();
     } catch (e) {
       showError($('#review-list'), e.message);

@@ -30,6 +30,7 @@
   .empty { color: #888; font-style: italic; padding: 20px 0; }
   .err { color: #b00020; font-size: 13px; margin-top: 6px; }
   .toolbar { margin-bottom: 14px; }
+  select#batch-select { padding: 6px 10px; border-radius: 4px; border: 1px solid #ccc; font-size: 13px; min-width: 320px; }
   .lane-title { font-size: 12px; text-transform: uppercase; color: #888; margin: 10px 0 4px; }
   .candidate { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
   .candidate:last-child { border-bottom: none; }
@@ -50,6 +51,10 @@
 </nav>
 <main>
   <section id="view-review" class="active">
+    <div class="toolbar row">
+      <label for="batch-select" class="meta">Review Batch:</label>
+      <select id="batch-select"></select>
+    </div>
     <div class="toolbar row">
       <button class="action primary" id="finalize-btn" disabled>Finalize Batch</button>
       <span id="finalize-hint" class="meta"></span>
