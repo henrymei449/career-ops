@@ -20,7 +20,7 @@ Vocabulary (`FIT_DECISIONS`, `review-schema.mjs`): `APPLY`, `INVESTIGATE`, `PASS
 
 - **`proposed_decision`** — set by `applyProposedDecisions()` (`review.mjs`). Non-authoritative. A review provider (human or SOP/LLM pass) proposes it against an `open/` batch; this never touches `review-state.json`.
 - **`final_decision`** — set only by `finalizeBatch()` (`review.mjs`), the *sole* place it is ever written. For each job: an explicit override (keyed by `job_key`) if given, else the reviewed `proposed_decision`. A human override wins and is recorded in `reason` as `[human override: was X]`; `proposed_decision` is preserved for audit.
-- Durable `fit_decision` in `review-state.json` becomes authoritative only via `ingestFinalizedReviewBatches()` (`review.mjs`), which moves a `finalized/` batch's `final_decision` values into `state.jobs[job_key].fit_decision`. Idempotent (tracked by `batch_id` + content hash); safe to call on every session start (currently wired into `doctor.mjs`'s lifecycle — see backlog #1 below) or by hand (`node review.mjs ingest`).
+- Durable `fit_decision` in `review-state.json` becomes authoritative only via `ingestFinalizedReviewBatches()` (`review.mjs`), which moves a `finalized/` batch's `final_decision` values into `state.jobs[job_key].fit_decision`. Idempotent (tracked by `batch_id` + content hash); safe to call on every session start (`doctor.mjs`'s opportunistic catch-all) or by hand (`node review.mjs ingest`). The primary trigger is `finalizeAndIngestBatch()` (`review.mjs`), which calls `finalizeBatch()` then this in the same operation — any human-facing finalizer (the operator UI, a future integration) should call it instead of `finalizeBatch()` alone, so durable state updates the moment a human finalizes, not whenever `doctor.mjs` next runs.
 
 | Trigger | Human vs automatic | Authoritative field | Prerequisites | Idempotency |
 |---|---|---|---|---|
@@ -99,7 +99,7 @@ A client must not treat a missing field (no `outreach` object, no `execution_sta
 
 ## Known backlog (not fixed in Pass 3, not to be fixed by any client of this contract)
 
-1. Finalized-batch ingestion currently occurs through `doctor.mjs`'s lifecycle (called on session start), not as a standalone always-on watcher. A client that needs fresher state than the last `doctor.mjs` run should call `ingestFinalizedReviewBatches()` itself rather than assuming it already ran.
+1. ~~Finalized-batch ingestion currently occurs through `doctor.mjs`'s lifecycle~~ — **fixed**: `review.mjs`'s `finalizeAndIngestBatch()` is now the primary lifecycle step (finalize + ingest in one call), used by the operator UI and any other human-facing finalizer. `doctor.mjs` still calls `ingestFinalizedReviewBatches()` on session start, but only as an opportunistic catch-all for a batch finalized outside that primary path (e.g. by hand) or a prior run that crashed between finalize and ingest — it is no longer the thing normal workflow state progression depends on.
 2. LinkedIn tracking params can create identity/dedup risk for the same requisition (URL-based `job_key` normalization does not yet strip every tracking-param variant that can alias the same posting).
 3. Structured geography classification can under-classify when Remote-US evidence exists only in JD free text rather than structured location fields.
 4. Functional-lane contact discovery quality (Serper-backed, Pass 2B) is imperfect and will be improved opportunistically from real failures — not a target for this contract or its clients to fix.

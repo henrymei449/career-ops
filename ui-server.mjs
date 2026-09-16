@@ -31,8 +31,7 @@ import {
   reviewPaths,
   readJson,
   defaultState,
-  loadOpenBatch,
-  finalizeBatch,
+  finalizeAndIngestBatch,
 } from './review.mjs';
 import {
   markApplied,
@@ -145,8 +144,13 @@ const API_ROUTES = [
   ['POST', '/api/review/finalize', async (body) => {
     const { batch_id: batchId, overrides = {}, reviewer } = body;
     if (!batchId) throw new Error('batch_id required');
-    const batch = finalizeBatch(batchId, { overrides, reviewer: reviewer || null, root: DATA_ROOT });
-    return { batch_id: batch.batch_id, status: batch.status };
+    const { batch, ingestion } = await finalizeAndIngestBatch(batchId, { overrides, reviewer: reviewer || null, root: DATA_ROOT });
+    return {
+      batch_id: batch.batch_id,
+      status: batch.status,
+      ingested: ingestion.ingested.includes(batchId),
+      ingestion_errors: ingestion.errors,
+    };
   }],
   ['GET', '/api/ready', async () => ({ jobs: listReadyToApply() })],
   ['POST', '/api/ready/applied', async (body) => {

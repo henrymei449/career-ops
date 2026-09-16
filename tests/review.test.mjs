@@ -21,6 +21,7 @@ import {
   applyProposedDecisions,
   validateReviewedOutput,
   finalizeBatch,
+  finalizeAndIngestBatch,
   ingestFinalizedReviewBatches,
   getJobState,
   isSuppressed,
@@ -199,6 +200,63 @@ async function main() {
     if (result2.ingested.length === 0 && stateFileBefore === stateFileAfter) {
       pass('9. re-running ingestion is a no-op (idempotent)');
     } else fail(`9. re-running ingestion was NOT a no-op: ${JSON.stringify(result2)}`);
+  }
+
+  // ── 11. finalizeAndIngestBatch() — the combined UI/service lifecycle step ──
+  {
+    const root = scratchRoot();
+    const applyJob = { ...SAMPLE_JOB, url: 'https://boards.greenhouse.io/acme/jobs/lc-apply', title: 'Manufacturing Solutions Consultant' };
+    const investigateJob = { ...SAMPLE_JOB, url: 'https://boards.greenhouse.io/acme/jobs/lc-inv', title: 'Manufacturing Consultant', location: 'United States' };
+    const passJob = { ...SAMPLE_JOB, url: 'https://boards.greenhouse.io/acme/jobs/lc-pass', title: 'Software Engineer II' };
+    const { batchId, batch } = createBatchFromJobs([applyJob, investigateJob, passJob], { root, source: 'test' });
+    const [aKey, iKey, pKey] = batch.jobs.map((j) => j.job_key);
+
+    // No SOP pass at all here — every decision arrives as a human override,
+    // exactly the shape the UI's Finalize Batch sends.
+    const overrides = { [aKey]: 'APPLY', [iKey]: 'INVESTIGATE', [pKey]: 'PASS' };
+
+    if (getJobState(aKey, { root }) === null) {
+      pass('11. before finalizeAndIngestBatch, durable state has no record for these jobs');
+    } else fail('11. durable state already had a record before finalizeAndIngestBatch ran');
+
+    const { batch: finalized, ingestion } = await finalizeAndIngestBatch(batchId, { overrides, reviewer: 'ui-test', root });
+
+    if (finalized.status === 'finalized') pass('11. finalizeAndIngestBatch finalizes the batch');
+    else fail(`11. batch did not finalize: status=${finalized.status}`);
+
+    if (ingestion.ingested.includes(batchId)) {
+      pass('11. finalizeAndIngestBatch ingests the SAME batch it just finalized, in one call');
+    } else fail(`11. finalizeAndIngestBatch did not report the batch as ingested: ${JSON.stringify(ingestion)}`);
+
+    // Durable state is updated IMMEDIATELY — no separate doctor.mjs/ingest
+    // call required, which is the whole point of this lifecycle function.
+    const applyState = getJobState(aKey, { root });
+    if (applyState?.fit_decision === 'APPLY' && applyState?.execution_status === 'READY_TO_APPLY') {
+      pass('11. APPLY reaches fit_decision=APPLY/execution_status=READY_TO_APPLY immediately, with no separate ingest call');
+    } else fail(`11. APPLY did not reach READY_TO_APPLY immediately: ${JSON.stringify(applyState)}`);
+
+    const investigateState = getJobState(iKey, { root });
+    const passState = getJobState(pKey, { root });
+    if (investigateState?.fit_decision === 'INVESTIGATE' && investigateState?.execution_status === 'NONE'
+      && passState?.fit_decision === 'PASS' && passState?.execution_status === 'NONE') {
+      pass('11. INVESTIGATE and PASS both land at execution_status=NONE');
+    } else fail(`11. INVESTIGATE/PASS execution_status leaked: ${JSON.stringify({ investigateState, passState })}`);
+
+    // finalized/ -> processed/ movement happens as part of the same call.
+    const p = reviewPaths(root);
+    if (!existsSync(join(p.finalized, `${batchId}.json`)) && existsSync(join(p.processed, `${batchId}.json`))) {
+      pass('11. batch moves from finalized/ to processed/ within the single finalizeAndIngestBatch call');
+    } else fail('11. batch was not moved to processed/ by finalizeAndIngestBatch');
+
+    // Re-running the general ingestion sweep (what doctor.mjs still does)
+    // afterward must be a harmless no-op — the UI/service path already did
+    // the real work, doctor.mjs is a catch-all, not a second write.
+    const stateFileBefore = readFileSync(p.statePath, 'utf-8');
+    const doctorSweep = await ingestFinalizedReviewBatches({ root });
+    const stateFileAfter = readFileSync(p.statePath, 'utf-8');
+    if (doctorSweep.ingested.length === 0 && stateFileBefore === stateFileAfter) {
+      pass('11. a subsequent doctor.mjs-style ingestion sweep is a harmless no-op (UI/service path is not doctor-dependent)');
+    } else fail(`11. subsequent ingestion sweep was not a no-op: ${JSON.stringify(doctorSweep)}`);
   }
 
   // ── 10. existing stable job identity is reused ─────────────────────────

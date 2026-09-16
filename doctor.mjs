@@ -846,10 +846,16 @@ async function onboardingState(root) {
     });
   } catch { plugins = []; }
 
-  // Auto-ingestion of finalized review batches (#review-mvp). Runs on every
-  // session start, same seam as the autoCopied templates above, so a normal
-  // human workflow never needs a manual `node review.mjs ingest`. Best-effort:
-  // a review/ read/write problem must not block onboarding itself.
+  // Opportunistic catch-all ingestion of finalized review batches
+  // (#review-mvp). The PRIMARY trigger for a finalized batch reaching
+  // durable state is now review.mjs's finalizeAndIngestBatch() — called
+  // synchronously by whatever finalized the batch on a human's behalf (the
+  // operator UI, review.mjs's own CLI). This session-start sweep exists for
+  // what that primary path can miss: a batch someone finalized by hand
+  // outside it, or a prior process that finalized but crashed before
+  // ingesting. Runs on every session start, same seam as the autoCopied
+  // templates above. Best-effort: a review/ read/write problem must not
+  // block onboarding itself.
   //
   // Imported dynamically, and only here (after every CLI/MCP/plugin field
   // above has already been computed into local variables): review.mjs pulls

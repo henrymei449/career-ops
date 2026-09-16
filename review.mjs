@@ -329,6 +329,40 @@ export function finalizeBatch(batchId, { overrides = {}, reviewer = null, root =
   return batch;
 }
 
+/**
+ * The canonical human-finalization lifecycle step: finalizeBatch() followed
+ * immediately by ingestFinalizedReviewBatches(). This — not doctor.mjs's
+ * session-start sweep — is now the primary trigger for a finalized batch
+ * reaching durable state. Any caller that finalizes a batch on a human's
+ * behalf (the operator UI, a future integration, the CLI) should call this
+ * instead of finalizeBatch() alone, so an APPLY decision is READY_TO_APPLY
+ * the moment the human acts, not whenever doctor.mjs next happens to run.
+ *
+ * Duplicates neither function's logic — it is exactly finalizeBatch() +
+ * ingestFinalizedReviewBatches(), in that order, sharing the SAME lock,
+ * hash-tracking, atomic-write, and processed/ archival semantics both
+ * already have. ingestFinalizedReviewBatches() sweeps every pending
+ * finalized/ batch (not just this one) because that sweep is itself
+ * idempotent and safe — see ingestFinalizedReviewBatches()'s own doc comment
+ * — so this never leaves an unrelated already-finalized batch behind.
+ *
+ * doctor.mjs keeps calling ingestFinalizedReviewBatches() directly on every
+ * session start: that remains a useful opportunistic catch-all (a batch
+ * finalized by hand outside this lifecycle step, or a prior run that
+ * finalized but crashed before ingesting), but it is no longer the
+ * conceptual owner of "when does a finalized batch become durable" — this
+ * function is.
+ *
+ * @param {string} batchId
+ * @param {{overrides?: Record<string,string>, reviewer?: string, root?: string}} [opts]
+ * @returns {Promise<{batch: object, ingestion: {ingested: string[], skipped: string[], errors: Array<{batchId: string, errors: string[]}>}}>}
+ */
+export async function finalizeAndIngestBatch(batchId, { overrides = {}, reviewer = null, root = DATA_ROOT } = {}) {
+  const batch = finalizeBatch(batchId, { overrides, reviewer, root });
+  const ingestion = await ingestFinalizedReviewBatches({ root });
+  return { batch, ingestion };
+}
+
 // Exported for the same reason as readJson above — outreach.mjs's own
 // read-modify-write of data/review-state.json needs the identical empty
 // shape when the file does not exist yet, not a hand-copied duplicate.

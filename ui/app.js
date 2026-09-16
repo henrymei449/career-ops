@@ -127,8 +127,14 @@ function updateFinalizeButton(jobs) {
     const overrides = {};
     for (const j of jobs) overrides[j.job_key] = state.reviewSelections[j.job_key];
     try {
-      await api('POST', '/api/review/finalize', { batch_id: batchId, overrides });
+      const result = await api('POST', '/api/review/finalize', { batch_id: batchId, overrides });
       state.reviewSelections = {};
+      if (!result.ingested) {
+        // finalizeAndIngestBatch() finalized the batch but the durable-state
+        // ingestion pass did not report it as ingested — surface loudly
+        // rather than silently leaving Ready to Apply stale.
+        showError($('#review-list'), `Batch finalized but not yet reflected in durable state: ${JSON.stringify(result.ingestion_errors)}`);
+      }
       loadReview();
     } catch (e) {
       showError($('#review-list'), e.message);
