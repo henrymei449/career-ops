@@ -215,15 +215,48 @@ async function loadReady() {
     } else if (job.url) {
       card.appendChild(el('div', { class: 'meta', text: job.url }));
     }
-    row.appendChild(el('button', {
-      class: 'action primary',
-      text: 'Mark Applied',
-      onclick: async () => {
-        if (!confirm(`Mark ${job.company} — ${job.title} as APPLIED? This is a real, human-confirmed action.`)) return;
-        try { await api('POST', '/api/ready/applied', { job_key: job.job_key }); loadReady(); }
-        catch (e) { showError(card, e.message); }
+    // Two-step INLINE confirm, not window.confirm(): a native confirm()
+    // dialog gave zero visible feedback on its cancel path (button click ->
+    // dialog resolves false -> bare `return` -> nothing in the DOM changes),
+    // which is indistinguishable from the button being broken — confirmed as
+    // the actual root cause of a report where a real production Mark Applied
+    // click appeared to do nothing (durable state showed the backend
+    // transition never fired; the click never got past this line). Native
+    // confirm() is also unreliable to drive/observe across environments
+    // (e.g. auto-dismissed under browser automation) — replacing it removes
+    // that whole failure class rather than patching one symptom of it.
+    const markBtn = el('button', { class: 'action primary', text: 'Mark Applied' });
+    markBtn.addEventListener('click', () => {
+      if (markBtn.dataset.confirming === 'true') {
+        markBtn.disabled = true;
+        markBtn.textContent = 'Marking…';
+        api('POST', '/api/ready/applied', { job_key: job.job_key })
+          .then(() => loadReady())
+          .catch((e) => {
+            markBtn.disabled = false;
+            markBtn.dataset.confirming = 'false';
+            markBtn.textContent = 'Mark Applied';
+            cancelBtn.style.display = 'none';
+            showError(card, e.message);
+          });
+        return;
+      }
+      markBtn.dataset.confirming = 'true';
+      markBtn.textContent = `Confirm: mark ${job.company} applied?`;
+      cancelBtn.style.display = '';
+    });
+    const cancelBtn = el('button', {
+      class: 'action',
+      text: 'Cancel',
+      style: 'display:none',
+      onclick: () => {
+        markBtn.dataset.confirming = 'false';
+        markBtn.textContent = 'Mark Applied';
+        cancelBtn.style.display = 'none';
       },
-    }));
+    });
+    row.appendChild(markBtn);
+    row.appendChild(cancelBtn);
     card.appendChild(row);
     listEl.appendChild(card);
   }

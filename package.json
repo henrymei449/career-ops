@@ -27,6 +27,7 @@
     "cv:verify-facts": "node verify-cv-facts.mjs",
     "cv:verify-ats": "node verify-ats.mjs",
     "test:cv-visual": "playwright test --config=playwright.cv.config.mjs",
+    "test:ui": "playwright test --config=playwright.ui.config.mjs",
     "test:cv-visual:update": "playwright test --config=playwright.cv.config.mjs --update-snapshots",
     "sync-check": "node cv-sync-check.mjs",
     "update:check": "node update-system.mjs check",
