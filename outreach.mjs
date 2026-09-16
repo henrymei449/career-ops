@@ -85,6 +85,14 @@ import {
   dedupeCandidates,
   rankCandidates,
 } from './outreach-schema.mjs';
+import { localToday } from './lib/local-today.mjs';
+import {
+  freshContactAction,
+  withContactActionDefaults,
+  buildFollowUpAction,
+  sortFollowUpActions,
+  actionId as followUpActionId,
+} from './followup-schema.mjs';
 
 // Reuses the plugin engine's own dotenv loader (plugins/_engine.mjs) rather
 // than a second copy: it reads .env from the resolved Data Root
@@ -317,10 +325,109 @@ export async function selectContacts(jobKey, candidateIds, { root = DATA_ROOT } 
     if (missing.length) {
       throw new Error(`outreach: ${jobKey} — unknown candidate id(s): ${missing.join(', ')}`);
     }
-    job.outreach.selected_contacts = candidateIds.map((id) => ({ ...byId.get(id) }));
+    job.outreach.selected_contacts = candidateIds.map((id) => ({ ...freshContactAction(), ...byId.get(id) }));
     job.outreach.status = 'CONTACTS_SELECTED';
     return { ...job.outreach };
   }, { root });
+}
+
+/**
+ * Derive the operator's Follow-up queue from durable outreach state — no
+ * second source of truth (docs/careerops-state-model.md's Pass 4 addendum).
+ * Every job's outreach.selected_contacts is the read model; the
+ * OVERDUE/TODAY/UPCOMING/WAITING bucket is computed at read time from each
+ * contact's own status/next_action/next_action_due (followup-schema.mjs's
+ * deriveBucket). `today` is injectable for deterministic tests.
+ *
+ * @param {{root?: string, today?: string}} [opts]
+ */
+export function listFollowUpActions({ root = DATA_ROOT, today = localToday() } = {}) {
+  const p = reviewPaths(root);
+  const state = readJson(p.statePath, defaultState());
+  const actions = [];
+  for (const [jobKey, job] of Object.entries(state.jobs)) {
+    for (const contact of job.outreach?.selected_contacts || []) {
+      const action = buildFollowUpAction({ jobKey, job, contact, todayStr: today });
+      if (action) actions.push(action);
+    }
+  }
+  return sortFollowUpActions(actions);
+}
+
+/**
+ * Resolve a follow-up action_id back to its (job_key, contact index) by
+ * recomputing followUpActionId() over every current candidate — action_id
+ * is a one-way hash (see followup-schema.mjs), so this is the lookup
+ * instead of a second id->record table that could drift.
+ */
+function findFollowUpTarget(state, targetActionId) {
+  for (const [jobKey, job] of Object.entries(state.jobs)) {
+    const contacts = job.outreach?.selected_contacts || [];
+    for (let i = 0; i < contacts.length; i++) {
+      if (followUpActionId(jobKey, contacts[i].candidate_id) === targetActionId) {
+        return { jobKey, index: i };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Mark Done: resolves the CURRENT action on this contact. Never chains to a
+ * next action automatically (no follow-up-generation engine in this pass).
+ * If the contact's status was still CONTACT_SELECTED, this action WAS the
+ * initial outreach, so it also transitions CONTACT_SELECTED -> OUTREACH_SENT
+ * and stamps sent_at; any other status is left as-is.
+ *
+ * @param {string} targetActionId
+ */
+export async function completeFollowUpAction(targetActionId, { root = DATA_ROOT } = {}) {
+  const p = reviewPaths(root);
+  return withPipelineLock(p.statePath, async () => {
+    const state = readJson(p.statePath, defaultState());
+    const target = findFollowUpTarget(state, targetActionId);
+    if (!target) throw new Error(`follow-up: no action found for action_id ${targetActionId}`);
+    const job = state.jobs[target.jobKey];
+    const contact = withContactActionDefaults(job.outreach.selected_contacts[target.index]);
+    const now = new Date().toISOString();
+    contact.last_action_at = now;
+    contact.next_action = null;
+    contact.next_action_due = null;
+    if (contact.status === 'CONTACT_SELECTED') {
+      contact.status = 'OUTREACH_SENT';
+      contact.sent_at = now;
+    }
+    job.outreach.selected_contacts[target.index] = contact;
+    state.updated_at = now;
+    atomicWriteFile(p.statePath, JSON.stringify(state, null, 2) + '\n');
+    return { job_key: target.jobKey, contact: { ...contact } };
+  });
+}
+
+/**
+ * Skip: no snooze, no rescheduling — the contact's action is simply
+ * dismissed and the row disappears from the queue.
+ *
+ * @param {string} targetActionId
+ */
+export async function skipFollowUpAction(targetActionId, { root = DATA_ROOT } = {}) {
+  const p = reviewPaths(root);
+  return withPipelineLock(p.statePath, async () => {
+    const state = readJson(p.statePath, defaultState());
+    const target = findFollowUpTarget(state, targetActionId);
+    if (!target) throw new Error(`follow-up: no action found for action_id ${targetActionId}`);
+    const job = state.jobs[target.jobKey];
+    const contact = withContactActionDefaults(job.outreach.selected_contacts[target.index]);
+    const now = new Date().toISOString();
+    contact.status = 'SKIPPED';
+    contact.last_action_at = now;
+    contact.next_action = null;
+    contact.next_action_due = null;
+    job.outreach.selected_contacts[target.index] = contact;
+    state.updated_at = now;
+    atomicWriteFile(p.statePath, JSON.stringify(state, null, 2) + '\n');
+    return { job_key: target.jobKey, contact: { ...contact } };
+  });
 }
 
 /**

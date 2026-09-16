@@ -5,11 +5,12 @@
 // a locally-cached guess.
 
 const state = {
-  view: 'review',
+  view: 'followup',
   reviewSelections: {}, // job_key -> 'APPLY' | 'INVESTIGATE' | 'PASS'
   outreachSelections: {}, // job_key -> Set(candidate_id)
   selectedBatchId: null, // Review tab's currently selected open batch
   applicationsFilter: 'alive', // Applications tab's currently selected filter
+  followupExpanded: null, // action_id of the currently expanded Follow-up row, or null
 };
 
 function $(sel, root = document) { return root.querySelector(sel); }
@@ -507,13 +508,126 @@ function renderOutreachCard(job) {
   return card;
 }
 
-// ── Follow-up (stub) ─────────────────────────────────────────────────────
+// ── Follow-up (Pass 4: operator home / action engine) ───────────────────
+//
+// Reads GET /api/followup (a derived queue over outreach.selected_contacts
+// — see followup-schema.mjs) and posts Mark Done / Skip. Never a second
+// source of truth: the row disappears once the server confirms the mutation,
+// re-fetched from the same read every other tab uses.
 
-async function loadFollowup() {
-  const listEl = $('#followup-list');
-  listEl.innerHTML = '';
-  try { await api('GET', '/api/followup'); }
-  catch (e) { showError(listEl, e.message); }
+function formatDueLabel(action) {
+  if (!action.due_at) return action.bucket === 'WAITING' ? 'Waiting' : '—';
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const due = new Date(`${action.due_at}T00:00:00`);
+  if (action.bucket === 'TODAY') return 'Today';
+  return due.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
-setView('review');
+async function loadFollowup() {
+  const countsEl = $('#followup-counts');
+  const listEl = $('#followup-list');
+  listEl.innerHTML = '<p class="empty">Loading…</p>';
+  countsEl.innerHTML = '';
+  let data;
+  try { data = await api('GET', '/api/followup'); }
+  catch (e) { listEl.innerHTML = ''; showError(listEl, e.message); return; }
+
+  const actions = data.actions;
+  const counts = { OVERDUE: 0, TODAY: 0, UPCOMING: 0, WAITING: 0 };
+  for (const a of actions) counts[a.bucket] = (counts[a.bucket] || 0) + 1;
+  for (const [bucket, label] of [['TODAY', 'Today'], ['OVERDUE', 'Overdue'], ['UPCOMING', 'Upcoming'], ['WAITING', 'Waiting']]) {
+    countsEl.appendChild(el('div', { class: `fu-chip ${bucket.toLowerCase()}` }, [
+      el('span', { text: label }),
+      el('b', { text: String(counts[bucket]) }),
+    ]));
+  }
+
+  listEl.innerHTML = '';
+  if (actions.length === 0) {
+    listEl.appendChild(el('p', { class: 'empty', text: 'Nothing needs action right now.' }));
+    return;
+  }
+
+  const table = el('table', { class: 'fu-table' });
+  const thead = el('thead', {}, el('tr', {}, [
+    el('th', { text: 'Due' }), el('th', { text: 'Company' }), el('th', { text: 'Role' }),
+    el('th', { text: 'Action' }), el('th', { text: 'Person' }), el('th', { text: 'Channel' }),
+  ]));
+  table.appendChild(thead);
+  const tbody = el('tbody');
+  for (const action of actions) {
+    for (const r of renderFollowUpRows(action)) tbody.appendChild(r);
+  }
+  table.appendChild(tbody);
+  listEl.appendChild(table);
+}
+
+function renderFollowUpRows(action) {
+  const row = el('tr', { class: 'fu-row', onclick: () => {
+    state.followupExpanded = state.followupExpanded === action.action_id ? null : action.action_id;
+    loadFollowup();
+  } });
+  row.appendChild(el('td', { class: `fu-due-${action.bucket}`, text: formatDueLabel(action) }));
+  row.appendChild(el('td', { text: action.company || '(company unknown)' }));
+  row.appendChild(el('td', { text: action.role || '(role unknown)' }));
+  row.appendChild(el('td', { text: action.action || '(none)' }));
+  row.appendChild(el('td', { text: action.contact_name || '(name unknown)' }));
+  row.appendChild(el('td', { text: action.channel || '' }));
+
+  const rows = [row];
+  if (state.followupExpanded === action.action_id) {
+    const detailCell = el('td', { colspan: '6' });
+    const grid = el('div', { class: 'fu-detail-grid' }, [
+      el('div', {}, [el('span', { text: 'Company:' }), document.createTextNode(action.company || '(unknown)')]),
+      el('div', {}, [el('span', { text: 'Role:' }), document.createTextNode(action.role || '(unknown)')]),
+      el('div', {}, [el('span', { text: 'Application status:' }), document.createTextNode(action.application_status)]),
+      el('div', {}, [el('span', { text: 'Application stage:' }), document.createTextNode(action.application_stage)]),
+      el('div', {}, [el('span', { text: 'Contact:' }), document.createTextNode(action.contact_name || '(unknown)')]),
+      el('div', {}, [el('span', { text: 'Contact role:' }), document.createTextNode(action.contact_role || '(unknown)')]),
+      el('div', {}, [el('span', { text: 'Contact status:' }), document.createTextNode(action.contact_status)]),
+      el('div', {}, [el('span', { text: 'Channel:' }), document.createTextNode(action.channel || '(unknown)')]),
+      el('div', {}, [el('span', { text: 'Current action:' }), document.createTextNode(action.action || '(none)')]),
+      el('div', {}, [el('span', { text: 'Due date:' }), document.createTextNode(action.due_at || '(none)')]),
+    ]);
+    const btnRow = el('div', { class: 'row' });
+    btnRow.appendChild(el('button', {
+      class: 'action',
+      text: 'Open Application',
+      onclick: (ev) => { ev.stopPropagation(); setView('applications'); },
+    }));
+    btnRow.appendChild(el('button', {
+      class: 'action',
+      text: 'Open Outreach',
+      onclick: (ev) => { ev.stopPropagation(); setView('outreach'); },
+    }));
+    const doneBtn = el('button', {
+      class: 'action primary',
+      text: 'Mark Done',
+      onclick: async (ev) => {
+        ev.stopPropagation();
+        doneBtn.disabled = true;
+        try { await api('POST', '/api/followup/complete', { action_id: action.action_id }); state.followupExpanded = null; loadFollowup(); }
+        catch (e) { doneBtn.disabled = false; showError(detailCell, e.message); }
+      },
+    });
+    const skipBtn = el('button', {
+      class: 'action',
+      text: 'Skip',
+      onclick: async (ev) => {
+        ev.stopPropagation();
+        skipBtn.disabled = true;
+        try { await api('POST', '/api/followup/skip', { action_id: action.action_id }); state.followupExpanded = null; loadFollowup(); }
+        catch (e) { skipBtn.disabled = false; showError(detailCell, e.message); }
+      },
+    });
+    btnRow.appendChild(doneBtn);
+    btnRow.appendChild(skipBtn);
+    detailCell.appendChild(grid);
+    detailCell.appendChild(btnRow);
+    const detailRow = el('tr', { class: 'fu-detail' }, detailCell);
+    rows.push(detailRow);
+  }
+  return rows;
+}
+
+setView('followup');

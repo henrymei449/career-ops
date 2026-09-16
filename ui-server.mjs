@@ -42,6 +42,9 @@ import {
   selectContacts,
   listOutreach,
   resolveSearchProvider,
+  listFollowUpActions,
+  completeFollowUpAction,
+  skipFollowUpAction,
 } from './outreach.mjs';
 import { intakeJob } from './adhoc-intake.mjs';
 
@@ -311,9 +314,22 @@ const API_ROUTES = [
     const outreach = await selectContacts(jobKey, candidateIds, { root: DATA_ROOT });
     return { status: outreach.status, selected_contacts: outreach.selected_contacts };
   }],
-  // Follow-up workflow is not implemented (docs/careerops-state-model.md) —
-  // this queue is read-only/empty by design, never a source of invented state.
-  ['GET', '/api/followup', async () => ({ jobs: [] })],
+  // Follow-up (Pass 4): derived queue over outreach.selected_contacts — no
+  // second source of truth. See followup-schema.mjs for the bucket rule and
+  // outreach.mjs for the read/mutation layer.
+  ['GET', '/api/followup', async () => ({ actions: listFollowUpActions() })],
+  ['POST', '/api/followup/complete', async (body) => {
+    const { action_id: actionId } = body;
+    if (!actionId) throw new Error('action_id required');
+    const { job_key: jobKey, contact } = await completeFollowUpAction(actionId, { root: DATA_ROOT });
+    return { job_key: jobKey, contact };
+  }],
+  ['POST', '/api/followup/skip', async (body) => {
+    const { action_id: actionId } = body;
+    if (!actionId) throw new Error('action_id required');
+    const { job_key: jobKey, contact } = await skipFollowUpAction(actionId, { root: DATA_ROOT });
+    return { job_key: jobKey, contact };
+  }],
   // Ad-hoc job intake (#pass3): paste-a-URL entry point into the SAME
   // review-batch pipeline every sourced job goes through. All capture/
   // dedupe/batch logic lives in adhoc-intake.mjs — this route only forwards
