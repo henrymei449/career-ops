@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CareerOps Operator</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, Segoe UI, Arial, sans-serif; margin: 0; background: #f5f6f8; color: #1c1e21; }
+  header { background: #1c2b3a; color: #fff; padding: 14px 20px; display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  nav { display: flex; gap: 4px; padding: 10px 20px 0; background: #fff; border-bottom: 1px solid #ddd; }
+  nav button { border: none; background: none; padding: 10px 16px; font-size: 14px; cursor: pointer; border-bottom: 3px solid transparent; color: #555; }
+  nav button.active { color: #1c2b3a; border-bottom-color: #1c2b3a; font-weight: 600; }
+  main { padding: 20px; max-width: 1100px; margin: 0 auto; }
+  section { display: none; }
+  section.active { display: block; }
+  .card { background: #fff; border: 1px solid #e1e4e8; border-radius: 6px; padding: 14px 16px; margin-bottom: 12px; }
+  .card h3 { margin: 0 0 4px; font-size: 15px; }
+  .meta { color: #666; font-size: 13px; margin-bottom: 8px; }
+  .reason { font-size: 13px; color: #333; background: #f8f9fa; border-radius: 4px; padding: 8px; margin-bottom: 10px; white-space: pre-wrap; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button.action { border: 1px solid #ccc; background: #fff; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  button.action:hover { background: #f0f1f3; }
+  button.primary { background: #1c2b3a; color: #fff; border-color: #1c2b3a; }
+  button.primary:hover { background: #2c3e50; }
+  button.action.selected { background: #1c2b3a; color: #fff; border-color: #1c2b3a; }
+  button.action:disabled { opacity: 0.5; cursor: not-allowed; }
+  .empty { color: #888; font-style: italic; padding: 20px 0; }
+  .err { color: #b00020; font-size: 13px; margin-top: 6px; }
+  .toolbar { margin-bottom: 14px; }
+  .lane-title { font-size: 12px; text-transform: uppercase; color: #888; margin: 10px 0 4px; }
+  .candidate { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
+  .candidate:last-child { border-bottom: none; }
+  .candidate label { flex: 1; cursor: pointer; }
+  .badge { display: inline-block; font-size: 11px; padding: 2px 6px; border-radius: 10px; background: #eef1f4; color: #444; margin-left: 6px; }
+  a { color: #1c5fb4; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CareerOps Operator</h1>
+</header>
+<nav>
+  <button data-view="review" class="active">Review</button>
+  <button data-view="ready">Ready to Apply</button>
+  <button data-view="outreach">Outreach</button>
+  <button data-view="followup">Follow-up</button>
+</nav>
+<main>
+  <section id="view-review" class="active">
+    <div class="toolbar row">
+      <button class="action primary" id="finalize-btn" disabled>Finalize Batch</button>
+      <span id="finalize-hint" class="meta"></span>
+    </div>
+    <div id="review-list"></div>
+  </section>
+
+  <section id="view-ready">
+    <div id="ready-list"></div>
+  </section>
+
+  <section id="view-outreach">
+    <div id="outreach-list"></div>
+  </section>
+
+  <section id="view-followup">
+    <p class="empty">Follow-up workflow is not implemented yet. This queue is read-only.</p>
+    <div id="followup-list"></div>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

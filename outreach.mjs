@@ -316,7 +316,7 @@ export function listOutreach({ root = DATA_ROOT, filter } = {}) {
  *      preferred over silently returning zero candidates, which would look
  *      like "nobody found" rather than "not configured".
  */
-async function resolveSearchProvider() {
+export async function resolveSearchProvider() {
   const modulePath = process.env.CAREER_OPS_SEARCH_PROVIDER;
   if (modulePath) {
     const resolved = path.isAbsolute(modulePath) ? modulePath : path.join(DATA_ROOT, modulePath);
