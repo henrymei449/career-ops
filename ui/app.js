@@ -255,8 +255,44 @@ async function loadReady() {
         cancelBtn.style.display = 'none';
       },
     });
+
+    // Same inline two-step confirm pattern as Mark Applied above — never
+    // window.confirm() (see the comment on markBtn for why).
+    const passBtn = el('button', { class: 'action', text: 'Pass' });
+    passBtn.addEventListener('click', () => {
+      if (passBtn.dataset.confirming === 'true') {
+        passBtn.disabled = true;
+        passBtn.textContent = 'Passing…';
+        api('POST', '/api/ready/pass', { job_key: job.job_key })
+          .then(() => loadReady())
+          .catch((e) => {
+            passBtn.disabled = false;
+            passBtn.dataset.confirming = 'false';
+            passBtn.textContent = 'Pass';
+            passCancelBtn.style.display = 'none';
+            showError(card, e.message);
+          });
+        return;
+      }
+      passBtn.dataset.confirming = 'true';
+      passBtn.textContent = 'Pass on this job? This removes it from Ready to Apply.';
+      passCancelBtn.style.display = '';
+    });
+    const passCancelBtn = el('button', {
+      class: 'action',
+      text: 'Cancel',
+      style: 'display:none',
+      onclick: () => {
+        passBtn.dataset.confirming = 'false';
+        passBtn.textContent = 'Pass';
+        passCancelBtn.style.display = 'none';
+      },
+    });
+
     row.appendChild(markBtn);
     row.appendChild(cancelBtn);
+    row.appendChild(passBtn);
+    row.appendChild(passCancelBtn);
     card.appendChild(row);
     listEl.appendChild(card);
   }

@@ -17,6 +17,7 @@ import {
 } from '../review.mjs';
 import {
   markApplied,
+  passOnApplication,
   setOutreachDecision,
   startOutreach,
   discoverContacts,
@@ -278,6 +279,95 @@ async function main() {
     if (after.fit_decision === 'APPLY' && after.company === beforeApply.company && after.url === beforeApply.url) {
       pass('13. outreach.mjs mutation preserves Pass 1 fields (fit_decision, company, url) untouched');
     } else fail('13. outreach.mjs mutation clobbered a Pass 1 field');
+  }
+
+  // ── Pass on application: READY_TO_APPLY -> NOT_APPLYING ─────────────
+  // Preserves the original review judgment (fit_decision stays APPLY) while
+  // recording the later human decision not to pursue the role separately.
+
+  // P1. READY_TO_APPLY -> NOT_APPLYING; fit_decision stays APPLY
+  {
+    const root = scratchRoot();
+    const jobKey = await setupAppliedReady(root);
+    const { alreadyPassed, job } = await passOnApplication(jobKey, { root });
+    if (!alreadyPassed && job.execution_status === 'NOT_APPLYING' && job.fit_decision === 'APPLY') {
+      pass('P1. passOnApplication transitions READY_TO_APPLY -> NOT_APPLYING while fit_decision stays APPLY');
+    } else fail(`P1. passOnApplication did not transition correctly: ${JSON.stringify(job)}`);
+  }
+
+  // P2. closed_reason = USER_PASS, closed_at populated
+  {
+    const root = scratchRoot();
+    const jobKey = await setupAppliedReady(root);
+    const { job } = await passOnApplication(jobKey, { root });
+    if (job.closed_reason === 'USER_PASS' && typeof job.closed_at === 'string' && job.closed_at.length > 0) {
+      pass('P2. passOnApplication sets closed_reason=USER_PASS and a populated closed_at');
+    } else fail(`P2. closed_reason/closed_at not set correctly: ${JSON.stringify(job)}`);
+  }
+
+  // P3. repeated Pass is idempotent — closed_at/closed_reason unchanged
+  {
+    const root = scratchRoot();
+    const jobKey = await setupAppliedReady(root);
+    const first = await passOnApplication(jobKey, { root });
+    const second = await passOnApplication(jobKey, { root });
+    if (!first.alreadyPassed && second.alreadyPassed
+        && second.job.closed_at === first.job.closed_at
+        && second.job.closed_reason === first.job.closed_reason) {
+      pass('P3. repeated passOnApplication invocation is safe/idempotent (closed_at/closed_reason unchanged)');
+    } else fail(`P3. duplicate passOnApplication invocation was not idempotent: ${JSON.stringify({ first, second })}`);
+  }
+
+  // P4. APPLIED cannot be demoted to NOT_APPLYING via this transition
+  {
+    const root = scratchRoot();
+    const jobKey = await setupAppliedReady(root);
+    await markApplied(jobKey, { root });
+    try {
+      await passOnApplication(jobKey, { root });
+      fail('P4. passOnApplication should have refused an already-APPLIED job');
+    } catch (err) {
+      if (/execution_status=APPLIED/.test(err.message)) pass('P4. passOnApplication refuses to demote an APPLIED job');
+      else fail(`P4. passOnApplication threw the wrong error: ${err.message}`);
+    }
+  }
+
+  // P5. invalid fit_decision (PASS/INVESTIGATE) cannot use this transition
+  {
+    const root = scratchRoot();
+    const { batchId, batch } = createBatchFromJobs([{ ...SAMPLE_JOB, url: 'https://boards.greenhouse.io/acme/jobs/1001' }], { root, source: 'test' });
+    const jobKey = batch.jobs[0].job_key;
+    applyProposedDecisions(batchId, {
+      decisions: [{ job_key: jobKey, proposed_decision: 'PASS', reason: 'geography gate', reason_codes: [] }],
+    }, { root });
+    finalizeBatch(batchId, { root });
+    await ingestFinalizedReviewBatches({ root });
+    try {
+      await passOnApplication(jobKey, { root });
+      fail('P5. passOnApplication should have refused a PASS-decision job');
+    } catch (err) {
+      if (/fit_decision=PASS/.test(err.message)) pass('P5. passOnApplication refuses a non-APPLY fit_decision');
+      else fail(`P5. passOnApplication threw the wrong error: ${err.message}`);
+    }
+  }
+
+  // P6. an INVESTIGATE-decision job (execution_status=NONE) cannot use this transition
+  {
+    const root = scratchRoot();
+    const { batchId, batch } = createBatchFromJobs([{ ...SAMPLE_JOB, url: 'https://boards.greenhouse.io/acme/jobs/1002' }], { root, source: 'test' });
+    const jobKey = batch.jobs[0].job_key;
+    applyProposedDecisions(batchId, {
+      decisions: [{ job_key: jobKey, proposed_decision: 'INVESTIGATE', reason: 'needs more info', reason_codes: [] }],
+    }, { root });
+    finalizeBatch(batchId, { root });
+    await ingestFinalizedReviewBatches({ root });
+    try {
+      await passOnApplication(jobKey, { root });
+      fail('P6. passOnApplication should have refused an INVESTIGATE-decision job');
+    } catch (err) {
+      if (/fit_decision=INVESTIGATE/.test(err.message)) pass('P6. passOnApplication refuses an INVESTIGATE fit_decision');
+      else fail(`P6. passOnApplication threw the wrong error: ${err.message}`);
+    }
   }
 }
 

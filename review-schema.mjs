@@ -28,7 +28,10 @@ export const FIT_DECISIONS = ['APPLY', 'INVESTIGATE', 'PASS'];
 // sets READY_TO_APPLY (for a finalized APPLY); everything else is NONE.
 // APPLIED is added in Pass 2 (outreach.mjs's markApplied) — a human-driven
 // transition out of READY_TO_APPLY, never set by ingestFinalizedReviewBatches.
-export const EXECUTION_STATUSES = ['NONE', 'READY_TO_APPLY', 'APPLIED'];
+// NOT_APPLYING is a second human-driven transition out of READY_TO_APPLY
+// (outreach.mjs's passOnApplication) for a job the human decides not to
+// pursue after all — it never rewrites fit_decision, which stays APPLY.
+export const EXECUTION_STATUSES = ['NONE', 'READY_TO_APPLY', 'APPLIED', 'NOT_APPLYING'];
 
 export const BATCH_STATUSES = ['open', 'finalized', 'processed'];
 

@@ -30,21 +30,24 @@ Vocabulary (`FIT_DECISIONS`, `review-schema.mjs`): `APPLY`, `INVESTIGATE`, `PASS
 
 ## Axis 2 — Execution status
 
-Vocabulary (`EXECUTION_STATUSES`, `review-schema.mjs`): `NONE`, `READY_TO_APPLY`, `APPLIED`.
+Vocabulary (`EXECUTION_STATUSES`, `review-schema.mjs`): `NONE`, `READY_TO_APPLY`, `APPLIED`, `NOT_APPLYING`.
 
 ```
 PASS / INVESTIGATE  → execution_status = NONE   (set at ingestion)
 APPLY (ingested)    → execution_status = READY_TO_APPLY
-human confirms send  → execution_status = APPLIED   (markApplied(), outreach.mjs)
+human confirms send  → execution_status = APPLIED       (markApplied(), outreach.mjs)
+human passes         → execution_status = NOT_APPLYING  (passOnApplication(), outreach.mjs)
 ```
 
 - Ingestion (`ingestFinalizedReviewBatches()`) sets `execution_status: decision === 'APPLY' ? 'READY_TO_APPLY' : 'NONE'` in the same write that sets `fit_decision`.
 - `markApplied(jobKey, {reviewer})` (`outreach.mjs`) is the only place `execution_status` moves to `APPLIED`. Requires `fit_decision === 'APPLY'` and `execution_status === 'READY_TO_APPLY'`. Sets `applied_at` (ISO timestamp) and initializes `job.outreach = freshOutreach()` (decision `PENDING`, status `NOT_STARTED`). Idempotent: calling it again on an already-`APPLIED` job returns `{alreadyApplied: true}` rather than throwing.
+- `passOnApplication(jobKey)` (`outreach.mjs`) is the only place `execution_status` moves to `NOT_APPLYING`. Requires `fit_decision === 'APPLY'` and `execution_status === 'READY_TO_APPLY'` — a human decided a job was worth applying to (review judgment) and later chose not to pursue it (execution decision); `fit_decision` is never rewritten to `PASS`. Sets `closed_at` (ISO timestamp) and `closed_reason: 'USER_PASS'`. Idempotent: calling it again on an already-`NOT_APPLYING` job returns `{alreadyPassed: true}` without rewriting `closed_at`/`closed_reason`. There is no reopening transition out of `NOT_APPLYING` — not implemented, not to be invented by any client.
 
 | Trigger | Human vs automatic | Authoritative field | Prerequisites | Idempotency |
 |---|---|---|---|---|
 | Batch ingestion | Automatic | `state.jobs[job_key].execution_status` | Finalized `APPLY`/other decision | Same ingestion idempotency as above |
 | Mark applied | Human (`markApplied()`) | `state.jobs[job_key].execution_status` | `fit_decision=APPLY`, `execution_status=READY_TO_APPLY` | Yes — repeat call is a safe no-op (`alreadyApplied: true`) |
+| Pass on application | Human (`passOnApplication()`) | `state.jobs[job_key].execution_status` | `fit_decision=APPLY`, `execution_status=READY_TO_APPLY` | Yes — repeat call is a safe no-op (`alreadyPassed: true`) |
 
 ## Axis 3 — Outreach decision
 

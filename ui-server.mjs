@@ -7,8 +7,8 @@
  * smallest usable page a human can run the same proven workflow from without
  * typing job keys, JSON, or CLI commands. It is a thin HTTP adapter only —
  * every transition below calls the EXACT function the CLI calls
- * (finalizeBatch, markApplied, setOutreachDecision, startOutreach,
- * discoverContacts, selectContacts). No transition rule, validation, or
+ * (finalizeBatch, markApplied, passOnApplication, setOutreachDecision,
+ * startOutreach, discoverContacts, selectContacts). No transition rule, validation, or
  * state write is duplicated here; this file only reads state to render it
  * and forwards button clicks to those functions.
  *
@@ -35,6 +35,7 @@ import {
 } from './review.mjs';
 import {
   markApplied,
+  passOnApplication,
   setOutreachDecision,
   startOutreach,
   discoverContacts,
@@ -194,6 +195,12 @@ const API_ROUTES = [
     if (!jobKey) throw new Error('job_key required');
     const { alreadyApplied, job } = await markApplied(jobKey, { reviewer: reviewer || null, root: DATA_ROOT });
     return { alreadyApplied, execution_status: job.execution_status, applied_at: job.applied_at };
+  }],
+  ['POST', '/api/ready/pass', async (body) => {
+    const { job_key: jobKey } = body;
+    if (!jobKey) throw new Error('job_key required');
+    const { alreadyPassed, job } = await passOnApplication(jobKey, { root: DATA_ROOT });
+    return { alreadyPassed, execution_status: job.execution_status, closed_at: job.closed_at, closed_reason: job.closed_reason };
   }],
   ['GET', '/api/outreach', async () => ({ jobs: listOutreachDetailed() })],
   ['POST', '/api/outreach/decision', async (body) => {

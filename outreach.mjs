@@ -58,6 +58,7 @@
  *
  * Usage:
  *   node outreach.mjs applied <job_key> [--outreach required|optional|waived] [--reviewer name]
+ *   node outreach.mjs pass <job_key>
  *   node outreach.mjs decide <job_key> <required|optional|waived>
  *   node outreach.mjs start <job_key>
  *   node outreach.mjs discover <job_key>
@@ -158,6 +159,35 @@ export async function markApplied(jobKey, { reviewer = null, root = DATA_ROOT } 
     job.outreach = freshOutreach();
     if (reviewer) job.applied_by = reviewer;
     return { alreadyApplied: false, job: { ...job } };
+  }, { root });
+}
+
+/**
+ * Human-driven transition: a finalized APPLY, currently READY_TO_APPLY,
+ * becomes NOT_APPLYING — the human later decided not to pursue it after all.
+ * Never touches fit_decision (stays APPLY, preserving the original review
+ * judgment); only the execution axis moves. Idempotent — calling this again
+ * on an already-NOT_APPLYING job is a safe no-op (returns
+ * {alreadyPassed: true}) that does not rewrite closed_at/closed_reason.
+ *
+ * @param {string} jobKey
+ * @param {{root?: string}} [opts]
+ */
+export async function passOnApplication(jobKey, { root = DATA_ROOT } = {}) {
+  return withJobState(jobKey, (job) => {
+    if (job.fit_decision !== 'APPLY') {
+      throw new Error(`outreach: ${jobKey} has fit_decision=${job.fit_decision}, not APPLY — cannot pass on it via this transition`);
+    }
+    if (job.execution_status === 'NOT_APPLYING') {
+      return { alreadyPassed: true, job: { ...job } };
+    }
+    if (job.execution_status !== 'READY_TO_APPLY') {
+      throw new Error(`outreach: ${jobKey} has execution_status=${job.execution_status}, not READY_TO_APPLY — cannot pass on it`);
+    }
+    job.execution_status = 'NOT_APPLYING';
+    job.closed_at = new Date().toISOString();
+    job.closed_reason = 'USER_PASS';
+    return { alreadyPassed: false, job: { ...job } };
   }, { root });
 }
 
@@ -383,6 +413,16 @@ async function main() {
     return;
   }
 
+  if (cmd === 'pass') {
+    const jobKey = argv[1];
+    if (!jobKey) { console.error('Usage: node outreach.mjs pass <job_key>'); process.exitCode = 1; return; }
+    const { alreadyPassed, job } = await passOnApplication(jobKey, {});
+    console.log(alreadyPassed
+      ? `${jobKey} is already NOT_APPLYING (closed_at: ${job.closed_at}).`
+      : `Application passed. execution_status=NOT_APPLYING, closed_at=${job.closed_at}, closed_reason=${job.closed_reason}`);
+    return;
+  }
+
   if (cmd === 'decide') {
     const [, jobKey, decision] = argv;
     if (!jobKey || !decision) { console.error('Usage: node outreach.mjs decide <job_key> <required|optional|waived>'); process.exitCode = 1; return; }
@@ -435,6 +475,7 @@ async function main() {
 
   console.log(`Usage:
   node outreach.mjs applied <job_key> [--outreach required|optional|waived] [--reviewer name]
+  node outreach.mjs pass <job_key>
   node outreach.mjs decide <job_key> <required|optional|waived>
   node outreach.mjs start <job_key>
   node outreach.mjs discover <job_key>
