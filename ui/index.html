@@ -27,6 +27,12 @@
   button.primary:hover { background: #2c3e50; }
   button.action.selected { background: #1c2b3a; color: #fff; border-color: #1c2b3a; }
   button.action:disabled { opacity: 0.5; cursor: not-allowed; }
+  .status-pill { display: inline-block; font-size: 11px; font-weight: 600; text-transform: uppercase; padding: 2px 8px; border-radius: 10px; margin-left: 8px; }
+  .status-ACTIVE { background: #e3f6e8; color: #1a7d3a; }
+  .status-STALE { background: #fff4d9; color: #8a6300; }
+  .status-REJECTED, .status-WITHDRAWN { background: #fbe4e4; color: #a01c1c; }
+  .status-CLOSED { background: #eee; color: #555; }
+  .status-UNKNOWN { background: #eef1f4; color: #555; }
   .empty { color: #888; font-style: italic; padding: 20px 0; }
   .err { color: #b00020; font-size: 13px; margin-top: 6px; }
   .toolbar { margin-bottom: 14px; }
@@ -46,6 +52,7 @@
 <nav>
   <button data-view="review" class="active">Review</button>
   <button data-view="ready">Ready to Apply</button>
+  <button data-view="applications">Applications</button>
   <button data-view="outreach">Outreach</button>
   <button data-view="followup">Follow-up</button>
 </nav>
@@ -64,6 +71,15 @@
 
   <section id="view-ready">
     <div id="ready-list"></div>
+  </section>
+
+  <section id="view-applications">
+    <div class="toolbar row">
+      <button class="action selected" data-app-filter="alive" id="app-filter-alive">Alive</button>
+      <button class="action" data-app-filter="all" id="app-filter-all">All</button>
+      <button class="action" data-app-filter="closed" id="app-filter-closed">Closed</button>
+    </div>
+    <div id="applications-list"></div>
   </section>
 
   <section id="view-outreach">

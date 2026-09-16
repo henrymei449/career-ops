@@ -139,6 +139,85 @@ function listOutreachDetailed() {
     }));
 }
 
+// ── Applications ("What Is Alive?" board, Pass 2) ───────────────────────────
+//
+// A job belongs here once it represents a real submitted application:
+// execution_status === 'APPLIED' (set only by markApplied(), never by this
+// file). This is a READ-ONLY view over durable state — no field written here.
+//
+// application_status/stage/last_update come from application-schema.mjs's
+// axis (Pass 1 migration). A job that reached APPLIED through the live
+// CareerOps workflow rather than the historical-sheet migration has none of
+// those fields (migrate-historical-applications.mjs deliberately left the
+// live-workflow jobs — e.g. IFS, Samsara, Datch — untouched). That is not a
+// "never infer state from absence" violation: nothing has closed, rejected,
+// or withdrawn that application through any known transition, so ACTIVE is
+// the only status consistent with everything actually recorded about it,
+// not a guess layered on top of a missing field.
+export const APPLICATION_ALIVE_STATUSES = ['ACTIVE', 'STALE'];
+export const APPLICATION_CLOSED_STATUSES = ['REJECTED', 'CLOSED', 'WITHDRAWN'];
+
+function effectiveApplicationStatus(job) {
+  return job.application_status || 'ACTIVE';
+}
+
+function humanizeOutreachStatus(status) {
+  if (!status) return '';
+  return status.toLowerCase().split('_').map((w) => w[0].toUpperCase() + w.slice(1)).join(' ');
+}
+
+function outreachDisplay(job) {
+  if (job.outreach && job.outreach.status) return humanizeOutreachStatus(job.outreach.status);
+  if (job.legacy_sheet && job.legacy_sheet.outreach_status_raw) return job.legacy_sheet.outreach_status_raw;
+  return '';
+}
+
+/** Comparable sort key: application_last_update (date) if present, else applied_at (timestamp), end-of-day normalized so date-only values compare correctly against full timestamps. */
+function applicationSortKey(job) {
+  if (job.application_last_update) return `${job.application_last_update}T23:59:59.999Z`;
+  return job.applied_at || '';
+}
+
+/**
+ * Applications view, filtered and sorted. `filter` is 'alive' | 'closed' | 'all'
+ * (default 'alive'). Sort: most recent activity first (applicationSortKey
+ * DESC), job_key ASC as a deterministic tie-breaker.
+ */
+export function listApplications(filter = 'alive', root = DATA_ROOT) {
+  const p = reviewPaths(root);
+  const state = readJson(p.statePath, defaultState());
+  const applied = Object.entries(state.jobs).filter(([, job]) => job.execution_status === 'APPLIED');
+
+  const rows = applied.map(([jobKey, job]) => {
+    const status = effectiveApplicationStatus(job);
+    return {
+      job_key: jobKey,
+      company: job.company,
+      title: job.title,
+      url: job.url || '',
+      applied_at: job.applied_at || null,
+      application_status: status,
+      application_stage: job.application_stage || 'Applied',
+      application_last_update: job.application_last_update || null,
+      outreach: outreachDisplay(job),
+      _sortKey: applicationSortKey(job),
+    };
+  });
+
+  const filtered = rows.filter((r) => {
+    if (filter === 'closed') return APPLICATION_CLOSED_STATUSES.includes(r.application_status);
+    if (filter === 'all') return true;
+    return APPLICATION_ALIVE_STATUSES.includes(r.application_status); // 'alive' (default)
+  });
+
+  filtered.sort((a, b) => {
+    const cmp = String(b._sortKey).localeCompare(String(a._sortKey));
+    return cmp !== 0 ? cmp : a.job_key.localeCompare(b.job_key);
+  });
+
+  return filtered.map(({ _sortKey, ...row }) => row);
+}
+
 // ── HTTP plumbing ────────────────────────────────────────────────────────
 
 function sendJson(res, status, body) {
@@ -202,6 +281,7 @@ const API_ROUTES = [
     const { alreadyPassed, job } = await passOnApplication(jobKey, { root: DATA_ROOT });
     return { alreadyPassed, execution_status: job.execution_status, closed_at: job.closed_at, closed_reason: job.closed_reason };
   }],
+  ['GET', '/api/applications', async (body, query) => ({ applications: listApplications(query.get('filter') || 'alive') })],
   ['GET', '/api/outreach', async () => ({ jobs: listOutreachDetailed() })],
   ['POST', '/api/outreach/decision', async (body) => {
     const { job_key: jobKey, decision } = body;

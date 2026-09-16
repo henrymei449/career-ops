@@ -9,6 +9,7 @@ const state = {
   reviewSelections: {}, // job_key -> 'APPLY' | 'INVESTIGATE' | 'PASS'
   outreachSelections: {}, // job_key -> Set(candidate_id)
   selectedBatchId: null, // Review tab's currently selected open batch
+  applicationsFilter: 'alive', // Applications tab's currently selected filter
 };
 
 function $(sel, root = document) { return root.querySelector(sel); }
@@ -54,6 +55,7 @@ function setView(view) {
 function loadView(view) {
   if (view === 'review') loadReview();
   else if (view === 'ready') loadReady();
+  else if (view === 'applications') loadApplications();
   else if (view === 'outreach') loadOutreach();
   else if (view === 'followup') loadFollowup();
 }
@@ -296,6 +298,52 @@ async function loadReady() {
     card.appendChild(row);
     listEl.appendChild(card);
   }
+}
+
+// ── Applications ("What Is Alive?" board — read-only) ───────────────────────
+
+$all('[data-app-filter]').forEach((b) => b.addEventListener('click', () => {
+  state.applicationsFilter = b.dataset.appFilter;
+  $all('[data-app-filter]').forEach((btn) => btn.classList.toggle('selected', btn === b));
+  loadApplications();
+}));
+
+function formatDate(iso) {
+  if (!iso) return '(unknown date)';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso; // e.g. a bare YYYY-MM-DD string parses fine, but be defensive
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+async function loadApplications() {
+  const listEl = $('#applications-list');
+  listEl.innerHTML = '<p class="empty">Loading…</p>';
+  let data;
+  try { data = await api('GET', `/api/applications?filter=${encodeURIComponent(state.applicationsFilter)}`); }
+  catch (e) { listEl.innerHTML = ''; showError(listEl, e.message); return; }
+
+  listEl.innerHTML = '';
+  if (data.applications.length === 0) {
+    listEl.appendChild(el('p', { class: 'empty', text: 'No applications in this view.' }));
+    return;
+  }
+  for (const app of data.applications) listEl.appendChild(renderApplicationCard(app));
+}
+
+function renderApplicationCard(app) {
+  const card = el('div', { class: 'card' });
+  const title = el('h3', { text: `${app.company} — ${app.title}` });
+  title.appendChild(el('span', { class: `status-pill status-${app.application_status}`, text: app.application_status }));
+  card.appendChild(title);
+  card.appendChild(el('div', { class: 'meta', text: `Applied: ${formatDate(app.applied_at)} · Stage: ${app.application_stage}` }));
+  card.appendChild(el('div', { class: 'meta', text: `Last update: ${app.application_last_update ? formatDate(app.application_last_update) : formatDate(app.applied_at)}` }));
+  if (app.outreach) card.appendChild(el('div', { class: 'meta', text: `Outreach: ${app.outreach}` }));
+  if (app.url && /^https?:\/\//i.test(app.url)) {
+    const link = el('div', { class: 'meta' });
+    link.appendChild(el('a', { href: app.url, target: '_blank', rel: 'noopener', text: app.url }));
+    card.appendChild(link);
+  }
+  return card;
 }
 
 // ── Outreach ─────────────────────────────────────────────────────────────
