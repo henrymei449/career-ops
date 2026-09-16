@@ -185,6 +185,41 @@ try {
   if (badEntryThrew) pass('pinpoint.fetch() throws when the careers_url is not a pinpointhq.com host');
   else fail('pinpoint.fetch() should throw for a non-pinpoint careers_url');
 
+  // #8C: explicit api: bypasses the pinpointhq.com host check for a tenant
+  // fronting the same postings.json shape on its own branded domain
+  // (confirmed: careers.infor.com/postings.json).
+  let brandedUrl = null;
+  const brandedFetched = await pinpoint.fetch(
+    { name: 'Infor', careers_url: 'https://careers.infor.com', api: 'https://careers.infor.com/postings.json' },
+    { fetchJson: async (url) => { brandedUrl = url; return sample; } },
+  );
+  if (brandedUrl === 'https://careers.infor.com/postings.json') {
+    pass('pinpoint.fetch() honors an explicit api: on a non-pinpointhq.com branded host');
+  } else {
+    fail(`pinpoint.fetch() with explicit api: requested ${JSON.stringify(brandedUrl)}`);
+  }
+  if (brandedFetched.length === 3 && brandedFetched[0]?.company === 'Infor') {
+    pass('pinpoint.fetch() with explicit api: returns normalized jobs with company from entry name');
+  } else {
+    fail(`pinpoint.fetch() with explicit api: returned ${brandedFetched.length} jobs`);
+  }
+
+  // detect() also honors explicit api: for the branded-host case (so registry
+  // auto-detection works even without an explicit provider: field).
+  const brandedDetect = pinpoint.detect({ name: 'Infor', api: 'https://careers.infor.com/postings.json' });
+  if (brandedDetect && brandedDetect.url === 'https://careers.infor.com/postings.json') {
+    pass('pinpoint.detect() honors an explicit api: on a non-pinpointhq.com branded host');
+  } else {
+    fail(`pinpoint.detect() with explicit api: returned ${JSON.stringify(brandedDetect)}`);
+  }
+
+  // detect() must still reject a non-https explicit api: rather than throwing.
+  if (pinpoint.detect({ name: 'X', api: 'http://careers.infor.com/postings.json' }) === null) {
+    pass('pinpoint.detect() returns null (not a throw) for a non-https explicit api:');
+  } else {
+    fail('pinpoint.detect() should reject a non-https explicit api: without throwing');
+  }
+
 } catch (e) {
   fail(`pinpoint provider tests crashed: ${e.message}`);
 }

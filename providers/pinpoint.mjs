@@ -13,16 +13,25 @@
 // Per-tenant subdomains are the variable part — SSRF defence uses a regex
 // match on `<safe-slug>.pinpointhq.com` rather than a static allowlist, the
 // same approach as the recruitee provider.
+//
+// Some tenants front the same postings.json feed on their own branded domain
+// instead of <slug>.pinpointhq.com (e.g. careers.infor.com/postings.json,
+// confirmed live 2026-09-16). An auto-detected careers_url must still match
+// PINPOINT_HOST_RE — that regex is the only SSRF guard on an arbitrary
+// scraped/imported URL. An explicit `api:` is different: it is operator-typed
+// portals.yml config, not auto-detected, so it is trusted the same way
+// successfactors.mjs trusts an explicit branded-host `api:`/`careers_url`
+// with no host allowlist at all — https: is still required.
 
 // The tenant label must be a valid DNS label: it may contain hyphens but must
 // not start or end with one (so `acme-.pinpointhq.com` is rejected). The
 // optional trailing group keeps single-character labels (e.g. `a.pinpointhq.com`)
-// valid. detect() and fetch() both route through this constant via
-// resolveApiUrl()/assertPinpointUrl(), so the stricter check applies everywhere.
+// valid. Only the auto-detected (careers_url-derived) path routes through
+// this constant — an explicit `api:` bypasses it (see resolveApiUrl).
 const PINPOINT_HOST_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.pinpointhq\.com$/;
 
 /** @param {string} url */
-function assertPinpointUrl(url) {
+function assertHttpsUrl(url) {
   let parsed;
   try {
     parsed = new URL(url);
@@ -30,13 +39,15 @@ function assertPinpointUrl(url) {
     throw new Error(`pinpoint: invalid URL: ${url}`);
   }
   if (parsed.protocol !== 'https:') throw new Error(`pinpoint: URL must use HTTPS: ${url}`);
-  if (!PINPOINT_HOST_RE.test(parsed.hostname)) {
-    throw new Error(`pinpoint: untrusted hostname "${parsed.hostname}" — must match <slug>.pinpointhq.com`);
-  }
   return url;
 }
 
 function resolveApiUrl(entry) {
+  // Explicit api: wins and bypasses the pinpointhq.com host check — trusted
+  // operator config for a tenant on its own branded domain (see header note).
+  if (typeof entry.api === 'string' && entry.api) {
+    return assertHttpsUrl(entry.api);
+  }
   const raw = typeof entry.careers_url === 'string' ? entry.careers_url : '';
   if (!raw) return null;
   let parsed;
@@ -55,14 +66,17 @@ export default {
   id: 'pinpoint',
 
   detect(entry) {
-    const apiUrl = resolveApiUrl(entry);
-    return apiUrl ? { url: apiUrl } : null;
+    try {
+      const apiUrl = resolveApiUrl(entry);
+      return apiUrl ? { url: apiUrl } : null;
+    } catch {
+      return null;
+    }
   },
 
   async fetch(entry, ctx) {
     const apiUrl = resolveApiUrl(entry);
     if (!apiUrl) throw new Error(`pinpoint: cannot derive API URL for ${entry.name}`);
-    assertPinpointUrl(apiUrl);
     // redirect:'error' prevents SSRF via server-side redirects
     const json = await ctx.fetchJson(apiUrl, { redirect: 'error' });
     return parsePinpointResponse(json, entry.name);
