@@ -791,7 +791,7 @@ function checkPersonalization(root) {
 // prerequisites that AGENTS.md "First Run" lists. `--json` turns the trigger into
 // a deterministic mechanism the agent runs (instead of re-deriving it from prose),
 // and `--target <dir>` lets the test suite point it at a simulated virgin env.
-function onboardingState(root) {
+async function onboardingState(root) {
   const autoCopied = [];
   const templates = [
     { target: 'modes/_profile.md', template: 'modes/_profile.template.md' },
@@ -845,6 +845,29 @@ function onboardingState(root) {
       return { id: m.id, hooks: m.hooks, enabled: s.enabled, missingEnv: s.missingEnv };
     });
   } catch { plugins = []; }
+
+  // Auto-ingestion of finalized review batches (#review-mvp). Runs on every
+  // session start, same seam as the autoCopied templates above, so a normal
+  // human workflow never needs a manual `node review.mjs ingest`. Best-effort:
+  // a review/ read/write problem must not block onboarding itself.
+  //
+  // Imported dynamically, and only here (after every CLI/MCP/plugin field
+  // above has already been computed into local variables): review.mjs pulls
+  // in scan.mjs, whose own top-level code loads dotenv against process.cwd()
+  // (i.e. --target when spawned that way) as a side effect of being
+  // imported. A static top-level import ran that BEFORE resolveActiveCli()
+  // below, so a CAREER_OPS_CLI set only in a target's .env file leaked into
+  // process.env early and doctor started reporting cli_source 'env' instead
+  // of '.env' — a real regression caught by
+  // tests/playwright-mcp-detection.test.mjs's .env scenario. Deferring the
+  // import until every field it could disturb has already been captured
+  // above removes the ordering dependency entirely.
+  let reviewIngested = { ingested: [], skipped: [], errors: [] };
+  try {
+    const { ingestFinalizedReviewBatches } = await import('./review.mjs');
+    reviewIngested = await ingestFinalizedReviewBatches({ root });
+  } catch { /* leave the default empty result; review.mjs's own CLI can diagnose */ }
+
   return {
     onboardingNeeded: missing.length > 0,
     missing,
@@ -862,12 +885,15 @@ function onboardingState(root) {
     playwright_mcp: playwrightMcp,
     active_cli: activeCli,
     cli_source: cliSource,
+    reviewIngested,
   };
 }
 
 if (JSON_OUT) {
-  console.log(JSON.stringify(onboardingState(projectRoot)));
-  process.exit(0);
+  onboardingState(projectRoot).then((state) => {
+    console.log(JSON.stringify(state));
+    process.exit(0);
+  });
 } else {
   main().catch((err) => {
     console.error('doctor.mjs failed:', err.message);

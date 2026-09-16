@@ -54,6 +54,10 @@ These files contain your personal data, customizations, and work product. Update
 | `reports/*` | Your evaluation reports |
 | `output/*` | Your generated PDFs |
 | `jds/*` | Your saved job descriptions |
+| `review/open/*` | Your open SOP review batches — sourced, possibly proposed-on, not yet finalized (written/read by `review.mjs`) |
+| `review/finalized/*` | Your human-finalized review batches awaiting ingestion (written by `review.mjs finalize`, drained by `ingestFinalizedReviewBatches()`) |
+| `review/processed/*` | Your already-ingested review batches, kept as the idempotency archive (moved here by ingestion; safe to archive/delete once you no longer need the audit trail) |
+| `data/review-state.json` | Your durable job_key → fit/execution decision store (`fit_decision`, `execution_status`, `reason`, provenance) — the only file `ingestFinalizedReviewBatches()` writes; rebuilt from `review/finalized/*` + `review/processed/*` if ever deleted, except for the ingestion ledger itself |
 
 ### Fork-local paths
 
@@ -117,6 +121,8 @@ These files contain system logic, scripts, templates, and instructions that impr
 | `modes/interview-prep.md` | Company-specific interview prep instructions |
 | `modes/interview-redflag.md` | Company red-flag detection instructions |
 | `modes/outcome.md` | Application outcome instructions |
+| `modes/review-sop.md` | First-pass-fit SOP — the canonical decision spec for the review-batch lifecycle (procedural; candidate facts it reads live in `modes/_brief.md`/`modes/_profile.md`/`config/profile.yml`, never here) |
+| `review.mjs` / `review-schema.mjs` | Review-batch lifecycle: survivor → UNREVIEWED batch → proposed decision → human finalization → idempotent ingestion → durable `data/review-state.json` |
 | `modes/interview/*` | Interview prep planning, practice, and debrief skills |
 | `modes/agent-inbox.md` | Agent inbox (queued requests) instructions |
 | `modes/reply-watch.md` | Employer reply classification instructions |
