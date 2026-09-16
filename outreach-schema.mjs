@@ -121,13 +121,59 @@ export function buildDiscoveryQueries({ company, persona }) {
 
 // ── Candidate normalization ─────────────────────────────────────────────
 
-const FORMER_RE = /\b(former|ex-|alumni|alumnus|previously at|past employee)\b/i;
+const FORMER_SIGNAL_WORDS = '(?:former|ex-|alumni|alumnus|previously at|past employee)';
+
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 /**
- * Parse a "Name - Title - Company | LinkedIn" style search-result title into
- * its parts. Deliberately tolerant of fewer segments — a raw result with
- * just "Name | LinkedIn" still yields a name, with title/company left blank
- * for the caller's context to fill in.
+ * Whether `text` names `targetCompany` as the employer a former-employee
+ * signal word ("former", "ex-", "alumni"/"alumnus", "previously at", "past
+ * employee") is ABOUT — not merely that the signal word and the company each
+ * appear somewhere in the text. Bounded to a same-clause window (never
+ * crossing '|', which separates independent clauses in these titles/
+ * snippets) so an unrelated former employer mentioned elsewhere in the text
+ * ("ex-AWS") is never attributed to a DIFFERENT company being searched for
+ * ("Augury") — the false rejection Pass 2B's live smoke caught. Checks both
+ * orderings: signal-then-company ("ex-Augury", "former ... at Augury") and
+ * company-then-signal ("Augury alum").
+ *
+ * @param {string} text
+ * @param {string} targetCompany
+ * @returns {boolean}
+ */
+function isFormerSignalForCompany(text, targetCompany) {
+  const esc = escapeRegExp(String(targetCompany ?? '').trim());
+  if (!esc) return false;
+  const signalThenCompany = new RegExp(`\\b${FORMER_SIGNAL_WORDS}\\b[^|]{0,40}?\\b${esc}\\b`, 'i');
+  const companyThenAlum = new RegExp(`\\b${esc}\\b[^|]{0,20}?\\b(?:alumni|alumnus)\\b`, 'i');
+  return signalThenCompany.test(text) || companyThenAlum.test(text);
+}
+
+// A parsed "company" segment (parseSearchResultTitle's 3rd dash/pipe
+// segment, or its "Title at Company" fallback) that is ITSELF a former-
+// employer marker — e.g. the trailing "ex-AWS" in the common LinkedIn-bio
+// shape "Name - Title at CurrentCo | ex-AWS" — names a PAST employer, not
+// the candidate's current one. FORMER_PREFIX_RE strips that marker so
+// normalizeCandidate can re-check the named company against the TARGET
+// company: an explicit "ex-Augury"/"former Augury" still rejects, but an
+// unrelated "ex-AWS" is treated as ambiguous (ex-employer noise), never as
+// the candidate's current-company value for the wrong-company check.
+const FORMER_PREFIX_RE = /^(?:former|ex-|previously at|past employee|alumni|alumnus)\s*/i;
+
+// A word-bounded " at " inside the title segment — the other common
+// real-world shape a search-result title takes ("Talent Acquisition
+// Partner at Tenable"), as opposed to a separate dash-delimited company
+// segment. Matched non-greedily so "Director of Sales at Foo at Bar" (rare)
+// still splits at the FIRST "at", which is the conservative reading.
+const TITLE_AT_COMPANY_RE = /^(.*?)\s+at\s+(.+)$/i;
+
+/**
+ * Parse a "Name - Title - Company | LinkedIn" (or "Name - Title at Company |
+ * LinkedIn") style search-result title into its parts. Deliberately tolerant
+ * of fewer segments — a raw result with just "Name | LinkedIn" still yields
+ * a name, with title/company left blank for the caller's context to fill in.
  *
  * @param {string} rawTitle
  * @returns {{name: string, title: string, company: string}}
@@ -138,11 +184,17 @@ export function parseSearchResultTitle(rawTitle) {
     .map((s) => s.trim())
     .filter(Boolean)
     .filter((s) => !/^linkedin$/i.test(s));
-  return {
-    name: segments[0] || '',
-    title: segments[1] || '',
-    company: segments[2] || '',
-  };
+  const name = segments[0] || '';
+  let title = segments[1] || '';
+  let company = segments[2] || '';
+  if (title && !company) {
+    const m = TITLE_AT_COMPANY_RE.exec(title);
+    if (m) {
+      title = m[1].trim();
+      company = m[2].trim();
+    }
+  }
+  return { name, title, company };
 }
 
 /**
@@ -162,13 +214,25 @@ export function normalizeCandidate(raw, { company, lane }) {
   if (!/linkedin\.com\/in\//i.test(url)) return null;
 
   const text = `${raw?.title ?? ''} ${raw?.snippet ?? ''}`;
-  if (FORMER_RE.test(text)) return null;
+  if (isFormerSignalForCompany(text, company)) return null;
 
   const parsed = parseSearchResultTitle(raw?.title ?? '');
   if (!parsed.name) return null;
 
+  // A parsed company that is itself a former-employer marker ("ex-AWS")
+  // names a past employer, not a current-company claim — strip it and
+  // decide from what it names, rather than feeding it straight into the
+  // wrong-company check below (see FORMER_PREFIX_RE's comment above).
+  let parsedCompany = parsed.company;
+  const formerMatch = FORMER_PREFIX_RE.exec(parsedCompany);
+  if (formerMatch) {
+    const namedCompany = parsedCompany.slice(formerMatch[0].length).trim();
+    if (namedCompany && normalizeCompany(namedCompany) === normalizeCompany(company)) return null; // explicit former-of-target
+    parsedCompany = ''; // an unrelated past employer — ambiguous, not current
+  }
+
   const targetKey = normalizeCompany(company);
-  const parsedKey = normalizeCompany(parsed.company);
+  const parsedKey = normalizeCompany(parsedCompany);
   if (parsedKey && targetKey && parsedKey !== targetKey) return null;
 
   const cleanUrl = url.split('?')[0].replace(/\/+$/, '');
@@ -176,7 +240,16 @@ export function normalizeCandidate(raw, { company, lane }) {
     candidate_id: candidateId(cleanUrl || parsed.name + company),
     name: parsed.name,
     title: parsed.title || '',
-    company: parsed.company || company || '',
+    // NEVER default to the searched-for `company` here (bug found live in
+    // Pass 2B's smoke test, #outreach-company-fabrication): when parsing
+    // cannot extract a company, that is a genuinely ambiguous result, not a
+    // confirmed match. Defaulting to the target company fabricated certainty
+    // — it let a Tenable recruiter rank as a same-company match for an
+    // Augury search purely because their title had no parseable company.
+    // Leaving it blank is what makes companyMatches false in
+    // scoreCandidate() below, so ranking correctly treats it as
+    // low-confidence (+10) instead of a false same-company match (+40).
+    company: parsedCompany || '',
     linkedin_url: cleanUrl,
     lane,
     source: 'WEB_SEARCH',

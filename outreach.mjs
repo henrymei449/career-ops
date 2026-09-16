@@ -32,11 +32,29 @@
  *
  * Search provider: contact discovery never calls a search API directly.
  * discoverContacts() takes a `searchProvider(query) -> Promise<rawResult[]>`
- * function (rawResult: {title, url, snippet}). The CLI's default provider
- * throws a clear "no provider configured" error rather than silently
- * returning zero candidates — see resolveSearchProvider() below. This is the
- * "very small interface" the task asked for: a real provider can be dropped
- * in later (env var module path) without changing any outreach state/schema.
+ * function (rawResult: {title, url, snippet}) — the interface stayed frozen
+ * across Pass 2B. The CLI's resolveSearchProvider() (below) wires exactly one
+ * real provider behind it: lib/outreach-search-serper.mjs (Serper, gated on
+ * SERPER_API_KEY from .env), used automatically when CAREER_OPS_SEARCH_PROVIDER
+ * is not set to something else. Either way, a missing/misconfigured provider
+ * throws a clear error rather than silently returning zero candidates.
+ *
+ * Live search is bounded to at most 2 queries per lane (MAX_QUERIES_PER_LANE
+ * below) regardless of how many queries buildDiscoveryQueries() generates —
+ * persona/query generation itself is untouched (outreach-schema.mjs), this
+ * just caps how many of its queries actually go out over the network per
+ * discover() call.
+ *
+ * Failure handling: a thrown searchProvider error propagates out of
+ * discoverContacts() BEFORE any state is written (see the function below —
+ * all provider calls happen before the single withJobState() write), so a
+ * provider/network failure leaves the job at SEARCH_REQUIRED, never
+ * CANDIDATES_FOUND with []. Pass 2's OUTREACH_STATUSES vocabulary is not
+ * extended with a SEARCH_FAILED state for this — the existing throw-and-leave-
+ * retryable behavior already satisfies "provider failure must never silently
+ * look like no relevant contacts exist" without touching the frozen state
+ * model; the CLI's outer catch (isMainModule block, bottom of this file) is
+ * the reporting mechanism.
  *
  * Usage:
  *   node outreach.mjs applied <job_key> [--outreach required|optional|waived] [--reviewer name]
@@ -47,7 +65,6 @@
  *   node outreach.mjs list [--filter required-search|required-found|optional]
  */
 
-import { existsSync } from 'fs';
 import path from 'path';
 
 import { getCareerOpsRoot } from './path-resolver.mjs';
@@ -55,6 +72,7 @@ import { atomicWriteFile } from './scan.mjs';
 import { withPipelineLock } from './pipeline-lock.mjs';
 import { flagValue } from './lib/cli-flags.mjs';
 import { isMainModule } from './lib/is-main-module.mjs';
+import { loadDotenvOnce } from './plugins/_engine.mjs';
 import { reviewPaths, readJson, defaultState } from './review.mjs';
 import {
   OUTREACH_DECISIONS,
@@ -67,7 +85,28 @@ import {
   rankCandidates,
 } from './outreach-schema.mjs';
 
+// Reuses the plugin engine's own dotenv loader (plugins/_engine.mjs) rather
+// than a second copy: it reads .env from the resolved Data Root
+// (getCareerOpsRoot()) — the SAME file the apify plugin's APIFY_TOKEN and
+// doctor.mjs's other keys already come from — not the repo checkout and not
+// process.cwd(). SERPER_API_KEY belongs in that one canonical secrets file.
+await loadDotenvOnce();
+
 const DATA_ROOT = getCareerOpsRoot();
+
+// Live search is bounded regardless of how many queries a persona family
+// generates (some functional lists chunk to 3 queries) — see the header
+// comment above for why this lives here rather than in outreach-schema.mjs.
+const MAX_QUERIES_PER_LANE = 2;
+
+/** Cap `queries` (buildDiscoveryQueries() output) to MAX_QUERIES_PER_LANE per lane. */
+function capQueriesPerLane(queries) {
+  const counts = {};
+  return queries.filter(({ lane }) => {
+    counts[lane] = (counts[lane] ?? 0) + 1;
+    return counts[lane] <= MAX_QUERIES_PER_LANE;
+  });
+}
 
 /**
  * Read-modify-write one job's durable state under the shared lock. `mutate`
@@ -185,7 +224,7 @@ export async function discoverContacts(jobKey, { searchProvider, root = DATA_ROO
   }
 
   const persona = classifyRoleFamily(job.title);
-  const queries = buildDiscoveryQueries({ company: job.company, persona });
+  const queries = capQueriesPerLane(buildDiscoveryQueries({ company: job.company, persona }));
 
   const rawByLane = [];
   for (const { lane, query } of queries) {
@@ -265,27 +304,38 @@ export function listOutreach({ root = DATA_ROOT, filter } = {}) {
 // ── Search provider resolution (CLI only — library callers pass their own) ─
 
 /**
- * Resolves a search provider for the CLI: CAREER_OPS_SEARCH_PROVIDER, if
- * set, is a module path whose default export is an async function
- * (query) => rawResult[]. Absent that, discovery cannot run — printing a
- * clear explanation is preferred over silently returning zero candidates,
- * which would look like "nobody found" rather than "not configured".
+ * Resolves a search provider for the CLI:
+ *   1. CAREER_OPS_SEARCH_PROVIDER, if set, names a module path whose default
+ *      export is an async function (query) => rawResult[] — an explicit
+ *      override always wins, so a different provider can be dropped in
+ *      later without touching this file.
+ *   2. Otherwise, if SERPER_API_KEY is set (.env or environment), the
+ *      built-in lib/outreach-search-serper.mjs is used — the one real
+ *      provider wired for this MVP (Pass 2B).
+ *   3. Otherwise, discovery cannot run. Throwing a clear explanation is
+ *      preferred over silently returning zero candidates, which would look
+ *      like "nobody found" rather than "not configured".
  */
 async function resolveSearchProvider() {
   const modulePath = process.env.CAREER_OPS_SEARCH_PROVIDER;
-  if (!modulePath) {
-    throw new Error(
-      'outreach: no search provider configured. Set CAREER_OPS_SEARCH_PROVIDER to a module path ' +
-      'whose default export is async (query) => [{title, url, snippet}, ...]. ' +
-      'This MVP intentionally ships no built-in search integration (see AGENTS.md non-goals).',
-    );
+  if (modulePath) {
+    const resolved = path.isAbsolute(modulePath) ? modulePath : path.join(DATA_ROOT, modulePath);
+    const mod = await import(`file://${resolved.replace(/\\/g, '/')}`);
+    if (typeof mod.default !== 'function') {
+      throw new Error(`outreach: ${modulePath} does not export a default async function`);
+    }
+    return mod.default;
   }
-  const resolved = path.isAbsolute(modulePath) ? modulePath : path.join(DATA_ROOT, modulePath);
-  const mod = await import(`file://${resolved.replace(/\\/g, '/')}`);
-  if (typeof mod.default !== 'function') {
-    throw new Error(`outreach: ${modulePath} does not export a default async function`);
+  if (process.env.SERPER_API_KEY) {
+    const mod = await import('./lib/outreach-search-serper.mjs');
+    return mod.default;
   }
-  return mod.default;
+  throw new Error(
+    'outreach: no search provider configured. Set SERPER_API_KEY in your career-ops data ' +
+    'root\'s .env (see .env.example, https://serper.dev for a key) to use the built-in Serper ' +
+    'provider, or set CAREER_OPS_SEARCH_PROVIDER to a module path whose default export is ' +
+    'async (query) => [{title, url, snippet}, ...] to use a different one.',
+  );
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────
