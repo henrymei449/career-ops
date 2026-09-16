@@ -15,7 +15,7 @@ const sandbox = mkdtempSync(join(tmpdir(), 'career-ops-followup-'));
 const priorRoot = process.env.CAREER_OPS_ROOT;
 process.env.CAREER_OPS_ROOT = sandbox;
 
-const { deriveBucket, withContactActionDefaults, actionId } = await import('../followup-schema.mjs');
+const { deriveBucket, withContactActionDefaults, actionId, applicationPendingActionId } = await import('../followup-schema.mjs');
 const { listFollowUpActions, completeFollowUpAction, skipFollowUpAction } = await import('../outreach.mjs');
 const { reviewPaths, defaultState } = await import('../review.mjs');
 
@@ -140,7 +140,7 @@ test('Mark Done on an already-OUTREACH_SENT contact resolves the action without 
   assert.equal(after1[0].bucket, 'WAITING');
 });
 
-test('Skip removes the row from the queue and sets status SKIPPED', async () => {
+test('Skip removes the per-contact row from the queue and sets status SKIPPED', async () => {
   seedState({
     'job:d': {
       company: 'Delta', title: 'Role D', fit_decision: 'APPLY', execution_status: 'APPLIED',
@@ -153,8 +153,16 @@ test('Skip removes the row from the queue and sets status SKIPPED', async () => 
   const { contact } = await skipFollowUpAction(before[0].action_id, { root: sandbox });
   assert.equal(contact.status, 'SKIPPED');
   assert.equal(contact.next_action, null);
+  // Pass 5 amendment: the application itself is still live (APPLIED, no
+  // application_status closure), so it does not vanish from Home — it falls
+  // back to the synthetic WAITING/APPLICATION_PENDING placeholder rather
+  // than disappearing, since Skip never closes the application.
   const after1 = listFollowUpActions({ root: sandbox, today: TODAY });
-  assert.equal(after1.length, 0);
+  assert.equal(after1.length, 1);
+  assert.equal(after1[0].action_id, applicationPendingActionId('job:d'));
+  assert.equal(after1[0].action, 'APPLICATION_PENDING');
+  assert.equal(after1[0].bucket, 'WAITING');
+  assert.equal(after1[0].contact_id, null);
 });
 
 test('an unknown action_id is refused loudly rather than silently no-op', async () => {

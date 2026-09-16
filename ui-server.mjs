@@ -45,8 +45,11 @@ import {
   listFollowUpActions,
   completeFollowUpAction,
   skipFollowUpAction,
+  updateApplicationStatus,
 } from './outreach.mjs';
 import { intakeJob } from './adhoc-intake.mjs';
+import { APPLICATION_ALIVE_STATUSES, APPLICATION_CLOSED_STATUSES } from './application-schema.mjs';
+import { deriveOutreachCompletion } from './followup-schema.mjs';
 
 const DATA_ROOT = getCareerOpsRoot();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -138,6 +141,8 @@ function listOutreachDetailed() {
       title: job.title,
       decision: job.outreach.decision,
       status: job.outreach.status,
+      // Derived job-level completion (Pass 5) — see deriveOutreachCompletion.
+      completion: deriveOutreachCompletion(job.outreach),
       candidates: job.outreach.candidates || [],
       selected_contacts: job.outreach.selected_contacts || [],
     }));
@@ -158,8 +163,11 @@ function listOutreachDetailed() {
 // or withdrawn that application through any known transition, so ACTIVE is
 // the only status consistent with everything actually recorded about it,
 // not a guess layered on top of a missing field.
-export const APPLICATION_ALIVE_STATUSES = ['ACTIVE', 'STALE'];
-export const APPLICATION_CLOSED_STATUSES = ['REJECTED', 'CLOSED', 'WITHDRAWN'];
+// Re-exported for backward compatibility with anything importing these two
+// constants from ui-server.mjs — application-schema.mjs is now their one
+// canonical definition (shared with followup-schema.mjs's closure
+// suppression, so the two views can never disagree about "closed").
+export { APPLICATION_ALIVE_STATUSES, APPLICATION_CLOSED_STATUSES };
 
 function effectiveApplicationStatus(job) {
   return job.application_status || 'ACTIVE';
@@ -170,8 +178,15 @@ function humanizeOutreachStatus(status) {
   return status.toLowerCase().split('_').map((w) => w[0].toUpperCase() + w.slice(1)).join(' ');
 }
 
+// Job-level outreach completion patch (Pass 5): render the DERIVED
+// completion (deriveOutreachCompletion — COMPLETE/IN_PROGRESS once contacts
+// are selected) rather than the raw, never-advancing CONTACTS_SELECTED
+// status, so "contacts chosen" and "contact work actually finished" read
+// differently on the Applications board. Legacy-sheet text (a historical
+// import's own free-text outreach status) is untouched — that is imported
+// evidence, not a CareerOps-native status to re-derive.
 function outreachDisplay(job) {
-  if (job.outreach && job.outreach.status) return humanizeOutreachStatus(job.outreach.status);
+  if (job.outreach && job.outreach.status) return humanizeOutreachStatus(deriveOutreachCompletion(job.outreach));
   if (job.legacy_sheet && job.legacy_sheet.outreach_status_raw) return job.legacy_sheet.outreach_status_raw;
   return '';
 }
@@ -286,6 +301,27 @@ const API_ROUTES = [
     return { alreadyPassed, execution_status: job.execution_status, closed_at: job.closed_at, closed_reason: job.closed_reason };
   }],
   ['GET', '/api/applications', async (body, query) => ({ applications: listApplications(query.get('filter') || 'alive') })],
+  // Applications -> Update Status (Pass 5): a small, human-confirmed
+  // lifecycle mutation on the EXACT job_key the operator opened — no role
+  // substitution, no requisition merging. See updateApplicationStatus() in
+  // outreach.mjs and application-schema.mjs's mapUiApplicationStatus() for
+  // the canonical field mapping and idempotency rules.
+  ['POST', '/api/applications/status', async (body) => {
+    const { job_key: jobKey, status, update_date: updateDate, note } = body;
+    if (!jobKey || !status) throw new Error('job_key and status required');
+    const job = await updateApplicationStatus(jobKey, status, {
+      updateDate: updateDate || null,
+      note: note || null,
+      root: DATA_ROOT,
+    });
+    return {
+      job_key: jobKey,
+      application_status: job.application_status,
+      application_outcome: job.application_outcome,
+      application_stage: job.application_stage,
+      application_last_update: job.application_last_update,
+    };
+  }],
   ['GET', '/api/outreach', async () => ({ jobs: listOutreachDetailed() })],
   ['POST', '/api/outreach/decision', async (body) => {
     const { job_key: jobKey, decision } = body;

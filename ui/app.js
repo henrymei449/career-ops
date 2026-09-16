@@ -11,7 +11,24 @@ const state = {
   selectedBatchId: null, // Review tab's currently selected open batch
   applicationsFilter: 'alive', // Applications tab's currently selected filter
   followupExpanded: null, // action_id of the currently expanded Follow-up row, or null
+  applicationsHighlightKey: null, // job_key to scroll to/highlight after Open Application
+  outreachHighlightKey: null, // job_key to scroll to/highlight after Open Outreach
 };
+
+function todayLocalStr() {
+  const d = new Date();
+  const localMs = d.getTime() - d.getTimezoneOffset() * 60000;
+  return new Date(localMs).toISOString().slice(0, 10);
+}
+
+/** Scroll a just-navigated-to card into view and highlight it briefly. */
+function highlightAndScroll(container, jobKey) {
+  if (!jobKey) return;
+  const target = container.querySelector(`[data-job-key="${CSS.escape(jobKey)}"]`);
+  if (!target) return;
+  target.classList.add('highlight');
+  target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
 
 function $(sel, root = document) { return root.querySelector(sel); }
 function $all(sel, root = document) { return Array.from(root.querySelectorAll(sel)); }
@@ -380,10 +397,25 @@ async function loadApplications() {
     return;
   }
   for (const app of data.applications) listEl.appendChild(renderApplicationCard(app));
+  highlightAndScroll(listEl, state.applicationsHighlightKey);
 }
 
+// UI status choice -> best-guess preselection, given the job's CURRENT
+// canonical application_status. CLOSED is ambiguous on its own (it could be
+// this UI's ROLE_CLOSED write, or an older historical import), so it
+// preselects ROLE_CLOSED as the closest real-world reading; anything else
+// with no exact match defaults to ACTIVE, same as the read-only board does.
+function guessUiStatus(applicationStatus) {
+  if (applicationStatus === 'REJECTED') return 'REJECTED';
+  if (applicationStatus === 'WITHDRAWN') return 'WITHDRAWN';
+  if (applicationStatus === 'CLOSED') return 'ROLE_CLOSED';
+  return 'ACTIVE';
+}
+
+const UI_STATUS_LABELS = { ACTIVE: 'ACTIVE', REJECTED: 'REJECTED', ROLE_CLOSED: 'ROLE CLOSED', WITHDRAWN: 'WITHDRAWN' };
+
 function renderApplicationCard(app) {
-  const card = el('div', { class: 'card' });
+  const card = el('div', { class: 'card', 'data-job-key': app.job_key });
   const title = el('h3', { text: `${app.company} — ${app.title}` });
   title.appendChild(el('span', { class: `status-pill status-${app.application_status}`, text: app.application_status }));
   card.appendChild(title);
@@ -395,6 +427,44 @@ function renderApplicationCard(app) {
     link.appendChild(el('a', { href: app.url, target: '_blank', rel: 'noopener', text: app.url }));
     card.appendChild(link);
   }
+
+  // ── Update Status (Pass 5) ────────────────────────────────────────────
+  const form = el('div', { class: 'status-form', style: 'display:none' });
+  const statusSelect = el('select', {}, Object.entries(UI_STATUS_LABELS).map(([value, text]) =>
+    el('option', { value, text, ...(value === guessUiStatus(app.application_status) ? { selected: 'selected' } : {}) })));
+  const dateInput = el('input', { type: 'date', value: todayLocalStr() });
+  const noteInput = el('textarea', { placeholder: 'Note / evidence (optional)', rows: '2' });
+  const saveBtn = el('button', { class: 'action primary', text: 'Save' });
+  const cancelFormBtn = el('button', { class: 'action', text: 'Cancel', onclick: () => { form.style.display = 'none'; } });
+  saveBtn.addEventListener('click', async () => {
+    saveBtn.disabled = true;
+    try {
+      await api('POST', '/api/applications/status', {
+        job_key: app.job_key,
+        status: statusSelect.value,
+        update_date: dateInput.value,
+        note: noteInput.value,
+      });
+      loadApplications();
+    } catch (e) {
+      saveBtn.disabled = false;
+      showError(form, e.message);
+    }
+  });
+  form.appendChild(el('div', { class: 'row' }, [el('label', { text: 'Current status:' }), document.createTextNode(app.application_status)]));
+  form.appendChild(el('div', { class: 'row' }, [el('label', { text: 'New status:' }), statusSelect]));
+  form.appendChild(el('div', { class: 'row' }, [el('label', { text: 'Update date:' }), dateInput]));
+  form.appendChild(el('div', { class: 'row' }, [el('label', { text: 'Note:' }), noteInput]));
+  form.appendChild(el('div', { class: 'row' }, [saveBtn, cancelFormBtn]));
+
+  const updateBtn = el('button', {
+    class: 'action',
+    text: 'Update Status',
+    onclick: () => { form.style.display = form.style.display === 'none' ? '' : 'none'; },
+  });
+  card.appendChild(el('div', { class: 'row', style: 'margin-top:10px' }, [updateBtn]));
+  card.appendChild(form);
+
   return card;
 }
 
@@ -411,11 +481,18 @@ async function loadOutreach() {
   if (data.jobs.length === 0) { listEl.appendChild(el('p', { class: 'empty', text: 'No APPLIED jobs yet.' })); return; }
 
   for (const job of data.jobs) listEl.appendChild(renderOutreachCard(job));
+  highlightAndScroll(listEl, state.outreachHighlightKey);
 }
 
 function renderOutreachCard(job) {
-  const card = el('div', { class: 'card' });
-  card.appendChild(el('h3', { text: `${job.company} — ${job.title}` }));
+  const card = el('div', { class: 'card', 'data-job-key': job.job_key });
+  const title = el('h3', { text: `${job.company} — ${job.title}` });
+  // Job-level outreach completion patch (Pass 5): the derived completion
+  // (COMPLETE/IN_PROGRESS once contacts are selected) shown next to the raw
+  // decision/status below, not instead of it — the operator can still see
+  // exactly which durable status the record is in.
+  if (job.completion) title.appendChild(el('span', { class: `completion-pill completion-${job.completion}`, text: job.completion }));
+  card.appendChild(title);
   card.appendChild(el('div', { class: 'meta', text: `decision: ${job.decision} · status: ${job.status}` }));
 
   if (job.decision === 'PENDING') {
@@ -562,7 +639,17 @@ async function loadFollowup() {
   listEl.appendChild(table);
 }
 
+// Pass 5 amendment: a synthetic Home row (the "no explicit contact action
+// yet" fallback — see buildApplicationPendingAction in followup-schema.mjs)
+// has no contact to act on. Detected by contact_id === null rather than by
+// action === 'APPLICATION_PENDING' string-matching, so it stays correct if
+// that label ever changes.
+function isApplicationPendingRow(action) {
+  return action.contact_id == null;
+}
+
 function renderFollowUpRows(action) {
+  const isPending = isApplicationPendingRow(action);
   const row = el('tr', { class: 'fu-row', onclick: () => {
     state.followupExpanded = state.followupExpanded === action.action_id ? null : action.action_id;
     loadFollowup();
@@ -571,8 +658,8 @@ function renderFollowUpRows(action) {
   row.appendChild(el('td', { text: action.company || '(company unknown)' }));
   row.appendChild(el('td', { text: action.role || '(role unknown)' }));
   row.appendChild(el('td', { text: action.action || '(none)' }));
-  row.appendChild(el('td', { text: action.contact_name || '(name unknown)' }));
-  row.appendChild(el('td', { text: action.channel || '' }));
+  row.appendChild(el('td', { text: isPending ? '—' : (action.contact_name || '(name unknown)') }));
+  row.appendChild(el('td', { text: isPending ? '—' : (action.channel || '') }));
 
   const rows = [row];
   if (state.followupExpanded === action.action_id) {
@@ -582,10 +669,10 @@ function renderFollowUpRows(action) {
       el('div', {}, [el('span', { text: 'Role:' }), document.createTextNode(action.role || '(unknown)')]),
       el('div', {}, [el('span', { text: 'Application status:' }), document.createTextNode(action.application_status)]),
       el('div', {}, [el('span', { text: 'Application stage:' }), document.createTextNode(action.application_stage)]),
-      el('div', {}, [el('span', { text: 'Contact:' }), document.createTextNode(action.contact_name || '(unknown)')]),
-      el('div', {}, [el('span', { text: 'Contact role:' }), document.createTextNode(action.contact_role || '(unknown)')]),
-      el('div', {}, [el('span', { text: 'Contact status:' }), document.createTextNode(action.contact_status)]),
-      el('div', {}, [el('span', { text: 'Channel:' }), document.createTextNode(action.channel || '(unknown)')]),
+      el('div', {}, [el('span', { text: 'Contact:' }), document.createTextNode(isPending ? '—' : (action.contact_name || '(unknown)'))]),
+      el('div', {}, [el('span', { text: 'Contact role:' }), document.createTextNode(isPending ? '—' : (action.contact_role || '(unknown)'))]),
+      el('div', {}, [el('span', { text: 'Contact status:' }), document.createTextNode(isPending ? '—' : action.contact_status)]),
+      el('div', {}, [el('span', { text: 'Channel:' }), document.createTextNode(isPending ? '—' : (action.channel || '(unknown)'))]),
       el('div', {}, [el('span', { text: 'Current action:' }), document.createTextNode(action.action || '(none)')]),
       el('div', {}, [el('span', { text: 'Due date:' }), document.createTextNode(action.due_at || '(none)')]),
     ]);
@@ -593,35 +680,55 @@ function renderFollowUpRows(action) {
     btnRow.appendChild(el('button', {
       class: 'action',
       text: 'Open Application',
-      onclick: (ev) => { ev.stopPropagation(); setView('applications'); },
+      onclick: (ev) => {
+        ev.stopPropagation();
+        // 'all' guarantees the target row is visible regardless of its
+        // alive/closed status — the operator asked to see THIS job, not
+        // whichever filter happened to be selected before.
+        state.applicationsFilter = 'all';
+        $all('[data-app-filter]').forEach((b) => b.classList.toggle('selected', b.dataset.appFilter === 'all'));
+        state.applicationsHighlightKey = action.job_key;
+        setView('applications');
+      },
     }));
     btnRow.appendChild(el('button', {
       class: 'action',
       text: 'Open Outreach',
-      onclick: (ev) => { ev.stopPropagation(); setView('outreach'); },
+      onclick: (ev) => {
+        ev.stopPropagation();
+        state.outreachHighlightKey = action.job_key;
+        setView('outreach');
+      },
     }));
-    const doneBtn = el('button', {
-      class: 'action primary',
-      text: 'Mark Done',
-      onclick: async (ev) => {
-        ev.stopPropagation();
-        doneBtn.disabled = true;
-        try { await api('POST', '/api/followup/complete', { action_id: action.action_id }); state.followupExpanded = null; loadFollowup(); }
-        catch (e) { doneBtn.disabled = false; showError(detailCell, e.message); }
-      },
-    });
-    const skipBtn = el('button', {
-      class: 'action',
-      text: 'Skip',
-      onclick: async (ev) => {
-        ev.stopPropagation();
-        skipBtn.disabled = true;
-        try { await api('POST', '/api/followup/skip', { action_id: action.action_id }); state.followupExpanded = null; loadFollowup(); }
-        catch (e) { skipBtn.disabled = false; showError(detailCell, e.message); }
-      },
-    });
-    btnRow.appendChild(doneBtn);
-    btnRow.appendChild(skipBtn);
+    // A synthetic APPLICATION_PENDING row has no contact for Mark Done/Skip
+    // to resolve — those routes correctly refuse an 'ap-' id (there is no
+    // per-contact action_id to find), so the buttons are simply not offered
+    // here rather than shown and failing on click. Update Status on the
+    // Applications tab is how the operator actually resolves this row.
+    if (!isPending) {
+      const doneBtn = el('button', {
+        class: 'action primary',
+        text: 'Mark Done',
+        onclick: async (ev) => {
+          ev.stopPropagation();
+          doneBtn.disabled = true;
+          try { await api('POST', '/api/followup/complete', { action_id: action.action_id }); state.followupExpanded = null; loadFollowup(); }
+          catch (e) { doneBtn.disabled = false; showError(detailCell, e.message); }
+        },
+      });
+      const skipBtn = el('button', {
+        class: 'action',
+        text: 'Skip',
+        onclick: async (ev) => {
+          ev.stopPropagation();
+          skipBtn.disabled = true;
+          try { await api('POST', '/api/followup/skip', { action_id: action.action_id }); state.followupExpanded = null; loadFollowup(); }
+          catch (e) { skipBtn.disabled = false; showError(detailCell, e.message); }
+        },
+      });
+      btnRow.appendChild(doneBtn);
+      btnRow.appendChild(skipBtn);
+    }
     detailCell.appendChild(grid);
     detailCell.appendChild(btnRow);
     const detailRow = el('tr', { class: 'fu-detail' }, detailCell);

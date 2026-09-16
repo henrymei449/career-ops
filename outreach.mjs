@@ -90,9 +90,11 @@ import {
   freshContactAction,
   withContactActionDefaults,
   buildFollowUpAction,
+  buildApplicationPendingAction,
   sortFollowUpActions,
   actionId as followUpActionId,
 } from './followup-schema.mjs';
+import { mapUiApplicationStatus } from './application-schema.mjs';
 
 // Reuses the plugin engine's own dotenv loader (plugins/_engine.mjs) rather
 // than a second copy: it reads .env from the resolved Data Root
@@ -218,6 +220,68 @@ export async function passOnApplication(jobKey, { root = DATA_ROOT } = {}) {
 }
 
 /**
+ * Applications -> Update Status (Pass 5): a small, human-confirmed mutation
+ * on the application lifecycle axis (application_status/outcome/stage/
+ * last_update) — a different axis from fit_decision/execution_status above,
+ * same additive-extension pattern application-schema.mjs already documents.
+ *
+ * Mutates ONLY the exact job_key given. No company/role matching, no
+ * fuzzy resolution — the caller (the Applications card the operator has
+ * open) already knows which job_key it means, and this function trusts
+ * that identity rather than re-deriving it, so it is structurally
+ * impossible for this call to "help" by updating a different requisition.
+ *
+ * Requires execution_status === 'APPLIED' — an application's outcome cannot
+ * be recorded before the application exists.
+ *
+ * `updateDate` defaults to today (local) and must be a real, non-future
+ * YYYY-MM-DD date — mirrors markApplied()'s appliedAt guard above, applied
+ * to a plain date instead of an ISO timestamp.
+ *
+ * `note` is optional free-text evidence. It is never used to overwrite prior
+ * evidence: each Save appends one entry to job.application_history (created
+ * on first use) rather than replacing a single field, so a later correction
+ * never erases what an earlier one recorded. Resubmitting the IDENTICAL
+ * (uiStatus, date, note) is a safe no-op on that history — the flat fields
+ * are still rewritten to match (never skipped), but no duplicate entry is
+ * appended.
+ *
+ * @param {string} jobKey
+ * @param {'ACTIVE'|'REJECTED'|'ROLE_CLOSED'|'WITHDRAWN'} uiStatus
+ * @param {{updateDate?: string|null, note?: string|null, root?: string}} [opts]
+ */
+export async function updateApplicationStatus(jobKey, uiStatus, { updateDate = null, note = null, root = DATA_ROOT } = {}) {
+  const mapped = mapUiApplicationStatus(uiStatus); // throws on an invalid uiStatus, before anything is touched
+  const date = updateDate || localToday();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    throw new Error(`outreach: updateApplicationStatus updateDate "${date}" is not a valid YYYY-MM-DD date`);
+  }
+  if (date > localToday()) {
+    throw new Error(`outreach: updateApplicationStatus updateDate "${date}" is in the future — refusing`);
+  }
+  const trimmedNote = note != null ? String(note).trim() : '';
+
+  return withJobState(jobKey, (job) => {
+    if (job.execution_status !== 'APPLIED') {
+      throw new Error(`outreach: ${jobKey} has execution_status=${job.execution_status}, not APPLIED — cannot update application status`);
+    }
+    job.application_status = mapped.application_status;
+    job.application_outcome = mapped.application_outcome;
+    job.application_stage = mapped.application_stage;
+    job.application_last_update = date;
+
+    if (!Array.isArray(job.application_history)) job.application_history = [];
+    const entry = { at: new Date().toISOString(), ui_status: uiStatus, update_date: date, note: trimmedNote || null };
+    const last = job.application_history[job.application_history.length - 1];
+    const isDuplicate = last && last.ui_status === entry.ui_status
+      && last.update_date === entry.update_date && last.note === entry.note;
+    if (!isDuplicate) job.application_history.push(entry);
+
+    return { ...job };
+  }, { root });
+}
+
+/**
  * Resolve the PENDING outreach decision into REQUIRED / OPTIONAL / WAIVED,
  * setting the initial status per DECISION_INITIAL_STATUS. Existing
  * candidates/selected_contacts are preserved (a decision change is not a
@@ -332,12 +396,26 @@ export async function selectContacts(jobKey, candidateIds, { root = DATA_ROOT } 
 }
 
 /**
- * Derive the operator's Follow-up queue from durable outreach state — no
- * second source of truth (docs/careerops-state-model.md's Pass 4 addendum).
- * Every job's outreach.selected_contacts is the read model; the
- * OVERDUE/TODAY/UPCOMING/WAITING bucket is computed at read time from each
- * contact's own status/next_action/next_action_due (followup-schema.mjs's
- * deriveBucket). `today` is injectable for deterministic tests.
+ * Derive the operator's Home queue from durable state — no second source of
+ * truth (docs/careerops-state-model.md's Pass 4 addendum, extended by the
+ * Pass 5 scope amendment). Every job's outreach.selected_contacts is the
+ * read model for per-contact rows; the OVERDUE/TODAY/UPCOMING/WAITING bucket
+ * is computed at read time from each contact's own
+ * status/next_action/next_action_due (followup-schema.mjs's deriveBucket).
+ * `today` is injectable for deterministic tests.
+ *
+ * Scoped to execution_status === 'APPLIED' — Home represents live submitted
+ * applications only, never a READY_TO_APPLY/NONE/PASS/INVESTIGATE job.
+ *
+ * Pass 5 amendment: "every live application is represented on Home" is now
+ * unconditional, not merely "whichever jobs happen to have a pending contact
+ * action." A job contributes its real per-contact rows when it has any; when
+ * it has none (outreach not started, fully resolved, or WAIVED with no
+ * contacts at all) it instead gets exactly one synthetic
+ * WAITING/APPLICATION_PENDING placeholder (buildApplicationPendingAction) so
+ * the application itself never silently disappears from the board. Both
+ * builders apply the same closed-application suppression, so a closed job
+ * contributes neither kind of row.
  *
  * @param {{root?: string, today?: string}} [opts]
  */
@@ -346,9 +424,15 @@ export function listFollowUpActions({ root = DATA_ROOT, today = localToday() } =
   const state = readJson(p.statePath, defaultState());
   const actions = [];
   for (const [jobKey, job] of Object.entries(state.jobs)) {
+    if (job.execution_status !== 'APPLIED') continue;
+    let hasAction = false;
     for (const contact of job.outreach?.selected_contacts || []) {
       const action = buildFollowUpAction({ jobKey, job, contact, todayStr: today });
-      if (action) actions.push(action);
+      if (action) { actions.push(action); hasAction = true; }
+    }
+    if (!hasAction) {
+      const pending = buildApplicationPendingAction({ jobKey, job });
+      if (pending) actions.push(pending);
     }
   }
   return sortFollowUpActions(actions);

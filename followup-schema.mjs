@@ -10,10 +10,34 @@
 // are DERIVED read-time buckets, never persisted — there is exactly one
 // source of truth (the contact's own status/next_action/next_action_due),
 // and the Follow-up queue is a view over it, not a second store.
+//
+// Pass 5 extends the same derived-view discipline several ways, all
+// read-time only, none adding a new durable field:
+//   - deriveOutreachCompletion(): the job-level outreach completion badge
+//     (COMPLETE/IN_PROGRESS) is computed from selected_contacts, never
+//     written back — see its own doc comment below.
+//   - buildFollowUpAction() suppresses a row once the job's application is
+//     closed (REJECTED/CLOSED/WITHDRAWN), so a dead application stops
+//     generating operator work without ever touching the contact's own
+//     status (never manufactures SKIPPED history).
+//   - buildApplicationPendingAction() (the Pass 5 scope amendment): the
+//     Follow-up tab becomes Home, the operator's single live-application
+//     board. Every non-terminal APPLIED job must be represented there even
+//     when it has no explicit contact action right now — this synthesizes
+//     the display-only WAITING/APPLICATION_PENDING fallback row for exactly
+//     that case. See outreach.mjs's listFollowUpActions for where the two
+//     row kinds (real per-contact actions vs. this fallback) are combined.
+
+import { APPLICATION_CLOSED_STATUSES } from './application-schema.mjs';
 
 export const CONTACT_STATUSES = ['CONTACT_SELECTED', 'OUTREACH_SENT', 'REPLIED', 'COMPLETE', 'SKIPPED'];
 export const NEXT_ACTIONS = ['SEND_EMAIL', 'SEND_MESSAGE', 'CHECK_CONNECTION', 'FOLLOW_UP'];
 export const FOLLOWUP_BUCKETS = ['OVERDUE', 'TODAY', 'UPCOMING', 'WAITING'];
+
+// Contact statuses that count as "executed/dispositioned" for job-level
+// outreach completion — the operator has actually done something with this
+// contact, as opposed to merely having selected them.
+export const EXECUTED_CONTACT_STATUSES = ['OUTREACH_SENT', 'COMPLETE', 'SKIPPED', 'REPLIED'];
 
 /** Fresh contact-action fields for a newly-selected contact. */
 export function freshContactAction() {
@@ -90,6 +114,13 @@ export function actionId(jobKey, candidateId) {
  * @param {{jobKey: string, job: object, contact: object, todayStr: string}} args
  */
 export function buildFollowUpAction({ jobKey, job, contact, todayStr }) {
+  // A closed/dead application generates no operator work — suppressed at
+  // read time only. The contact's own status/next_action are left exactly
+  // as they were, so re-opening the application (Applications -> Update
+  // Status -> ACTIVE) makes the row reappear with its real history intact.
+  const applicationStatus = job.application_status || 'ACTIVE';
+  if (APPLICATION_CLOSED_STATUSES.includes(applicationStatus)) return null;
+
   const withDefaults = withContactActionDefaults(contact);
   const bucket = deriveBucket(withDefaults, todayStr);
   if (!bucket) return null;
@@ -111,6 +142,58 @@ export function buildFollowUpAction({ jobKey, job, contact, todayStr }) {
   };
 }
 
+/**
+ * Stable id for the synthetic "no explicit action yet" Home row a live
+ * APPLIED application gets when none of its selected_contacts currently
+ * produce an actionable row (see outreach.mjs's listFollowUpActions). Same
+ * one-way imul-hash shape as actionId()/candidateId(), namespaced 'ap-'
+ * (never 'fu-') so a synthetic row's id can never collide with, or be
+ * mistaken for, a real per-contact action id — completeFollowUpAction/
+ * skipFollowUpAction correctly fail to resolve it (there is no contact to
+ * act on; the row is display-only).
+ */
+export function applicationPendingActionId(jobKey) {
+  const s = String(jobKey ?? '');
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  return `ap-${(h >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+/**
+ * Home-row fallback (Pass 5 scope amendment): a live, non-terminal APPLIED
+ * application with no current explicit contact action still needs to be
+ * represented on Home — "every live submitted application accounted for" is
+ * a hard requirement now, not merely a follow-up-if-outreach-needs-it view.
+ * APPLICATION_PENDING is a derived Home label only, never written back as a
+ * durable application or contact status, and this row has nothing for Mark
+ * Done/Skip to act on (contact_id is null).
+ *
+ * Same closure suppression as buildFollowUpAction: a closed application
+ * (REJECTED/CLOSED/WITHDRAWN) gets no row here either.
+ *
+ * @param {{jobKey: string, job: object}} args
+ */
+export function buildApplicationPendingAction({ jobKey, job }) {
+  const applicationStatus = job.application_status || 'ACTIVE';
+  if (APPLICATION_CLOSED_STATUSES.includes(applicationStatus)) return null;
+  return {
+    action_id: applicationPendingActionId(jobKey),
+    job_key: jobKey,
+    company: job.company,
+    role: job.title,
+    contact_id: null,
+    contact_name: null,
+    contact_role: '',
+    action: 'APPLICATION_PENDING',
+    channel: null,
+    due_at: null,
+    bucket: 'WAITING',
+    contact_status: null,
+    application_status: applicationStatus,
+    application_stage: job.application_stage || 'Applied',
+  };
+}
+
 const BUCKET_ORDER = { OVERDUE: 0, TODAY: 1, UPCOMING: 2, WAITING: 3 };
 
 /** Stable queue order: bucket severity first, then due date, then action_id as a tie-breaker. */
@@ -121,4 +204,38 @@ export function sortFollowUpActions(actions) {
     const dueCmp = String(a.due_at || '').localeCompare(String(b.due_at || ''));
     return dueCmp !== 0 ? dueCmp : a.action_id.localeCompare(b.action_id);
   });
+}
+
+/**
+ * Job-level outreach completion (Pass 5): whether contact work is ACTUALLY
+ * finished, derived from outreach.selected_contacts — never a second durable
+ * status. "Save Selected Contacts" only sets outreach.status=CONTACTS_SELECTED
+ * once, and that status never advances on its own as contacts get worked, so
+ * a job could look permanently unfinished (or permanently "selected but
+ * untouched") without this derivation.
+ *
+ * Only CONTACTS_SELECTED is re-derived — every other durable status already
+ * says what it means (NOT_STARTED/SEARCH_REQUIRED/CANDIDATES_FOUND: no
+ * contacts chosen yet; COMPLETE: already true, e.g. a WAIVED decision's
+ * initial status per outreach-schema.mjs's DECISION_INITIAL_STATUS) and is
+ * passed through unchanged.
+ *
+ *   any selected contact still CONTACT_SELECTED, or carrying a pending
+ *   next_action (regardless of its own status) -> IN_PROGRESS
+ *   every selected contact executed/dispositioned (EXECUTED_CONTACT_STATUSES)
+ *   with no pending next_action -> COMPLETE
+ *
+ * @param {{status?: string, selected_contacts?: object[]}|null|undefined} outreach
+ * @returns {string|null} one of OUTREACH_STATUSES, plus the derived
+ *   'IN_PROGRESS' value, or null if there is no outreach record at all.
+ */
+export function deriveOutreachCompletion(outreach) {
+  if (!outreach) return null;
+  if (outreach.status !== 'CONTACTS_SELECTED') return outreach.status;
+  const contacts = (outreach.selected_contacts || []).map(withContactActionDefaults);
+  if (contacts.length === 0) return outreach.status; // defensive: CONTACTS_SELECTED implies contacts exist
+  const hasPending = contacts.some((c) => c.status === 'CONTACT_SELECTED' || c.next_action != null);
+  if (hasPending) return 'IN_PROGRESS';
+  const allExecuted = contacts.every((c) => EXECUTED_CONTACT_STATUSES.includes(c.status));
+  return allExecuted ? 'COMPLETE' : 'IN_PROGRESS';
 }

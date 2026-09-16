@@ -17,6 +17,44 @@
 // lifecycle, not the CareerOps review/execution decision).
 export const APPLICATION_STATUSES = ['ACTIVE', 'REJECTED', 'CLOSED', 'STALE', 'WITHDRAWN', 'UNKNOWN'];
 
+// "What Is Alive?" partition of APPLICATION_STATUSES — the single definition
+// both the Applications board (ui-server.mjs) and Follow-up suppression
+// (followup-schema.mjs) read, so the two views can never disagree about
+// which statuses count as closed. UNKNOWN belongs to neither: an
+// unrecognized historical status is not evidence of either outcome.
+export const APPLICATION_ALIVE_STATUSES = ['ACTIVE', 'STALE'];
+export const APPLICATION_CLOSED_STATUSES = ['REJECTED', 'CLOSED', 'WITHDRAWN'];
+
+// Pass 5: the operator-facing choices on the Applications "Update Status"
+// control. Deliberately narrower than APPLICATION_STATUSES — STALE and
+// UNKNOWN are read-only signals a human observes, never a status they
+// explicitly set from this control.
+export const APPLICATION_UI_STATUSES = ['ACTIVE', 'REJECTED', 'ROLE_CLOSED', 'WITHDRAWN'];
+
+/**
+ * Map one Pass 5 "Update Status" UI choice to the canonical application_status
+ * / application_outcome / application_stage triple. Conservative and
+ * one-to-one by design (spec section 4) — ROLE_CLOSED maps to the existing
+ * CLOSED status (not a new one) so it participates in APPLICATION_CLOSED_STATUSES
+ * without widening that vocabulary.
+ *
+ * @param {string} uiStatus - one of APPLICATION_UI_STATUSES
+ * @returns {{application_status: string, application_outcome: string|null, application_stage: string|null}}
+ */
+export function mapUiApplicationStatus(uiStatus) {
+  const MAPPING = {
+    ACTIVE: { application_status: 'ACTIVE', application_outcome: null, application_stage: null },
+    REJECTED: { application_status: 'REJECTED', application_outcome: 'REJECTED', application_stage: 'Rejected' },
+    ROLE_CLOSED: { application_status: 'CLOSED', application_outcome: 'ROLE_CLOSED', application_stage: 'Role Closed' },
+    WITHDRAWN: { application_status: 'WITHDRAWN', application_outcome: 'WITHDRAWN', application_stage: 'Withdrawn' },
+  };
+  const mapped = MAPPING[uiStatus];
+  if (!mapped) {
+    throw new Error(`application-schema: invalid Update Status choice "${uiStatus}" — must be one of ${APPLICATION_UI_STATUSES.join(', ')}`);
+  }
+  return { ...mapped };
+}
+
 /**
  * Conservative mapping from an external tracker's free-text status into the
  * canonical vocabulary above. Never invents a lifecycle conclusion the
