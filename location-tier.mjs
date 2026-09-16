@@ -276,10 +276,140 @@ export function classifyLocationFallback(job = {}) {
  *
  * @returns {{state: 'REMOTE_US'|'NYC_COMPATIBLE'|'REJECT'|'UNKNOWN', reason: string}}
  */
-export function classifyGeography(job = {}) {
+// Conservative, provider-independent verification for remote eligibility.
+// This is a bounded text recognizer, not a complete interpretation of a JD.
+// Unknown restrictions/conditional office requirements never become acceptance.
+const STATE_NAMES = 'Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|New Hampshire|New Jersey|New Mexico|New York|North Carolina|North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island|South Carolina|South Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West Virginia|Wisconsin|Wyoming'.split('|');
+const STATE_CODES = [...US_STATE_ABBR];
+const STATE_CODE_BY_NAME = new Map(STATE_NAMES.map((name, i) => [name.toLowerCase(), STATE_CODES[i]]));
+
+// Explicit remote statements that don't use "this role is remote" phrasing:
+// "Location: Remote - US", "Office Requirements: Fully remote", "100% remote".
+// `(?!-)` keeps company-culture "remote-first"/"remote-friendly" out.
+const EXPLICIT_REMOTE_RE = /\b(?:location|work location|office requirements?|work (?:arrangement|model|type))\s*:\s*(?:fully |100% )?remote\b|(?:\bfully|\b100%|\bentirely)\s+remote\b(?!-)/i;
+// Remote explicitly scoped to the US: "Remote - US based", "Remote, USA", "Remote (US)".
+const REMOTE_US_SCOPE_RE = /\bremote\s*[-–—,(:]?\s*(?:United States|USA|US)\b/i;
+const NEW_YORK_EXCLUDED_RE = /(?:not (?:eligible|available|permitted|hiring)|cannot|excluding|except)\b[^.!?;]{0,70}\b(?:New York|NY)\b/i;
+// Where a person lives/works from, vs. when they work — see the time-zone
+// check in assessRemoteEligibility().
+// Phrase-level only: a bare word like "based" or "located" is too broad (it
+// also matches "based on business needs"). Requires the actual
+// candidate-location construction — "based in", "located in", "reside in",
+// "live in", "residents of", "domiciled in" — not merely the word's presence.
+const RESIDENCE_SCOPE_RE = /\b(?:be\s+)?(?:based|located)\s+in\b|\bresid(?:e|es|ed|ing|ence)\s+in\b|\bliv(?:e|es|ed|ing)\s+in\b|\bresidents?\s+of\b|\bdomiciled\s+in\b/i;
+// A time-zone limit stated directly as the value of a Location/work-model
+// field ("Location: Remote, USA (Central time zone preferred)") is a
+// residence constraint even without "based in"/"located in" wording — the
+// field label itself is what's doing the location-scoping. Reuses
+// EXPLICIT_REMOTE_RE's label set. Requires the label and the time-zone
+// mention to fall in the same clause (checked where this is used), so a
+// "Location:" sentence earlier in the JD can't reach into an unrelated,
+// later hours/schedule sentence.
+const LOCATION_FIELD_RE = /\b(?:location|work location|office requirements?|work (?:arrangement|model|type))\s*:/i;
+const SCHEDULE_SCOPE_RE = /\b(?:hours?|schedul\w*|shift|availability|available|coverage|overlap|standup|meetings?|business day)\b/i;
+// A JD phrase that names New York as a place the work happens.
+const NEW_YORK_WORK_OFFER_RE = /\b(?:based|located|work(?:ing)?|office|on[- ]?site|hybrid)\s+(?:in|from|out of)\s+(?:our\s+)?(?:New York|NYC|Manhattan)\b/i;
+
+function residenceStates(clause) {
+  const clean = clause.trim().replace(/^(?:one of (?:the )?(?:following )?states:?\s*)/i, '').replace(/\s+only$/i, '');
+  const parts = clean.split(/,|\bor\b|\band\b|\//i).map(part => part.trim()).filter(Boolean);
+  const codes = parts.map(part => STATE_CODE_BY_NAME.get(part.toLowerCase()) || (US_STATE_ABBR.has(part.toUpperCase()) ? part.toUpperCase() : null));
+  return codes.length && codes.every(Boolean) ? codes : null;
+}
+
+export function assessRemoteEligibility(job = {}, description = '', prior = classifyLocationFallback(job)) {
+  // Plain-text JDs (LinkedIn actors) run sentences together. Only the two
+  // constructions actually observed are repaired here, because a generic
+  // lowercase-to-uppercase split would also rewrite legitimate tokens
+  // ("LinkedIn" -> "Linked In"):
+  //   1. a US token ending a sentence — "anywhere in the USThe Company"
+  //   2. a glued field label — "...Sales EngineerLocation: Remote, USA"
+  const text = String(description || '').replace(/<[^>]*>/g, ' ').replace(/\bU\.S\.(?:A\.)?/gi, 'United States')
+    .replace(/\b(US|USA|United States)(?=[A-Z][a-z])/g, '$1 ')
+    .replace(/([a-z])(?=[A-Z][A-Za-z]{1,20}:\s)/g, '$1 ')
+    .replace(/\s+/g, ' ').trim();
+  const types = normalizeWorkplaceTypes(job.workplaceTypes);
+  const structuredRemote = job.workRemoteAllowed === true || types.some(t => WORKPLACE_REMOTE_RE.test(t));
+  const hint = REMOTE_RE.test(String(job.title || '') + ' ' + String(job.location || ''));
+  const explicitRemote = EXPLICIT_REMOTE_RE.test(text);
+  const roleRemote = explicitRemote || /(?:this (?:role|position|job)|the position|position role type:)\s*(?:is\s*:?\s*|will be |can be performed |may be performed |: )?(?:based )?(?:fully |primarily )?remote(?:ly)?\b/i.test(text);
+  if (!structuredRemote && !hint && !roleRemote) return null;
+  if (prior.reason === 'non-us-location') return prior;
+  if (NEW_YORK_EXCLUDED_RE.test(text)) {
+    return { state: 'REJECT', reason: 'remote-new-york-excluded' };
+  }
+  if (((hint || roleRemote) && job.workRemoteAllowed === false) ||
+      ((structuredRemote || hint || roleRemote) && types.some(t => WORKPLACE_ONSITE_RE.test(t) || WORKPLACE_HYBRID_RE.test(t))) ||
+      /(?:not (?:a |fully |entirely )?remote|no (?:option|opportunity)[^.!?;]{0,35}remote|remote work is not (?:permitted|allowed)|(?:cannot|may not|not permitted to)\s+work remotely|remote (?:role|position|work)[^.!?;]{0,20}not (?:available|allowed|permitted))/i.test(text) ||
+      /(?:this (?:role|position|job)|the position)\s+(?:is|will be)\s+(?:fully |primarily )?(?:on[- ]?site|in[- ]office|office-based|hybrid)\b/i.test(text)) {
+    return { state: 'UNKNOWN', reason: 'remote-conflicting-evidence' };
+  }
+  // Ignore explicit statements that office attendance is NOT required. Do not
+  // interpret interview attendance or occasional travel as recurring office work.
+  const officeText = text.replace(/(?:no|without)\s+(?:regular |required )?(?:on[- ]?site|in[- ]office|office)\s+(?:attendance|presence|work)(?:\s+(?:is )?required)?/gi, '');
+  if (/within[^.!?;]{0,65}(?:commut|miles?)|onsite presence|on-site presence|(?:required|must|expected to)[^.!?;]{0,40}(?:commut|report to (?:the )?office|work on[- ]?site)|\bhybrid\b|(?:office|on[- ]?site)[^.!?;]{0,25}(?:days? (?:per|a) week|weekly)/i.test(officeText)) {
+    return { state: 'UNKNOWN', reason: 'remote-onsite-or-proximity-unresolved' };
+  }
+  // A remote role whose RESIDENCE is scoped to US time zones that leave out
+  // Eastern cannot be worked from NYC. Only residence/location wording counts:
+  // a requirement or preference about working, business or coverage HOURS
+  // aligned to a time zone is a schedule, not a geography limit, and is left to
+  // the acceptance checks below. Each mention is judged in its own window
+  // INSIDE one sentence, so wording from a neighbouring sentence cannot leak in.
+  const zoneWindows = text.split(/[.!?;]/)
+    .flatMap(clause => [...clause.matchAll(/time\s*zones?\b/gi)]
+      .map(m => clause.slice(Math.max(0, m.index - 90), m.index + m[0].length + 60)))
+    .filter(w => /\b(?:central|mountain|pacific)\b/i.test(w) && (RESIDENCE_SCOPE_RE.test(w) || LOCATION_FIELD_RE.test(w)) && !SCHEDULE_SCOPE_RE.test(w));
+  if (zoneWindows.length && !zoneWindows.some(w => /\beastern\b/i.test(w))) {
+    return zoneWindows.some(w => /\bprefer/i.test(w))
+      ? { state: 'UNKNOWN', reason: 'remote-time-zone-unresolved' }
+      : { state: 'REJECT', reason: 'remote-time-zone-excludes-eastern' };
+  }
+  const restrictions = [...text.matchAll(/(?:must|are required to|need to)\s+(?:currently )?(?:reside|live|be based|be located)\s+(?:in|within)\s+([^.!?;]+)|open only to residents of\s+([^.!?;]+)|eligible states:\s*([^.!?;]+)/gi)];
+  let newYorkResidence = false;
+  for (const match of restrictions) {
+    const codes = residenceStates(match[1] || match[2] || match[3]);
+    if (!codes) return { state: 'UNKNOWN', reason: 'remote-residency-unresolved' };
+    if (!codes.includes('NY')) return { state: 'REJECT', reason: 'remote-residency-excludes-new-york' };
+    newYorkResidence = true;
+  }
+  // Unparsed restriction wording blocks even an otherwise nationwide statement.
+  if (!restrictions.length && /(?:residen(?:ce|cy|ts?)|must live|must be based|only (?:in|from)|restricted to|limited to|not available in|excluding|except for)/i.test(text)) {
+    return { state: 'UNKNOWN', reason: 'remote-residency-unresolved' };
+  }
+  const nationwide = /(?:work(?:ing)? remotely|remote (?:work|role|position)|(?:fully )?remote)[^.!?;]{0,50}\b(?:anywhere (?:in|within)|throughout|across) (?:the )?(?:United States|USA|US)\b|(?:this (?:role|position|job))[^.!?;]{0,55}\bremote[^.!?;]{0,40}\ball 50 states\b/i.test(text);
+  if (nationwide || newYorkResidence) return { state: 'REMOTE_US', reason: newYorkResidence ? 'remote-new-york-residency-confirmed' : 'remote-nationwide-confirmed' };
+  // An explicit remote statement counts as US-eligible only with a US scope:
+  // stated in the text ("Remote - US based"), or a bare "United States" listing.
+  // A remote hint beside a specific non-NYC city (e.g. "- Remote", Philadelphia)
+  // still falls through to the unverified UNKNOWN below.
+  if (explicitRemote && (REMOTE_US_SCOPE_RE.test(text) || isBareUnitedStates(job.location))) {
+    return { state: 'REMOTE_US', reason: 'remote-explicit-us-scope' };
+  }
+  // Preserve existing explicit Remote-US/native classifications when no
+  // contradictory restriction is found. Only the previously rejected US-city
+  // plus remote-hint path changes: it requires proof and otherwise is UNKNOWN.
+  if (hint && hasExplicitUsSignal(String(job.location || ''), String(job.urlHint || '')) && prior.state === 'REJECT') {
+    return { state: 'UNKNOWN', reason: 'remote-us-residency-unverified' };
+  }
+  if (roleRemote && prior.state === 'REJECT') return { state: 'UNKNOWN', reason: 'remote-us-residency-unverified' };
+  return null;
+}
+
+export function classifyGeography(job = {}, description = job.description || '') {
   const structured = classifyStructuredWorkplace(job);
-  if (structured.state !== 'UNKNOWN') return structured;
-  return classifyLocationFallback(job);
+  const prior = structured.state !== 'UNKNOWN' ? structured : classifyLocationFallback(job);
+  const result = assessRemoteEligibility(job, description, prior) || prior;
+  // Listed location elsewhere, but the title names New York AND the JD offers it
+  // as a work location ("Based in New York or San Francisco"). Title or JD alone
+  // is not enough; hard rejects (non-US, residency, time zone) are never overridden.
+  if ((result.state === 'UNKNOWN' || result.reason === 'location-tier-us-non-nyc') && NYC_METRO_RE.test(String(job.title || ''))) {
+    const text = String(description || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ');
+    if (NEW_YORK_WORK_OFFER_RE.test(text) && !NEW_YORK_EXCLUDED_RE.test(text)) {
+      return { state: 'NYC_COMPATIBLE', reason: 'title-and-jd-offer-new-york' };
+    }
+  }
+  return result;
 }
 
 // Pure local string parsing of a Workday job URL's `/job/{Location-Slug}/`

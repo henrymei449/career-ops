@@ -3421,7 +3421,8 @@ async function main() {
         // it can never silently reach the pipeline. This REPLACES the old
         // location_filter() call at this position (location_filter itself is
         // untouched and still used by Lane B's runRecallEligibilityChecks).
-        const geography = classifyGeography(job);
+        // Read cached or inline JD only for geography; other gates keep their inputs.
+        const geography = classifyGeography(job, resolveJobDescriptionText(job));
         if (geography.state !== 'REMOTE_US' && geography.state !== 'NYC_COMPATIBLE') {
           totalFilteredLocation++;
           continue;

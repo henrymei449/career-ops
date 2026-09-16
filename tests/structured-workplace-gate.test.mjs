@@ -43,14 +43,14 @@ test('scan.mjs imports classifyGeography from location-tier.mjs', () => {
 });
 
 test('a non-(REMOTE_US|NYC_COMPATIBLE) geography state is an unconditional continue', () => {
-  const gateIdx = SCAN_SRC.indexOf('const geography = classifyGeography(job);');
+  const gateIdx = SCAN_SRC.indexOf('const geography = classifyGeography(job, resolveJobDescriptionText(job));');
   assert.notEqual(gateIdx, -1, 'gate call site not found');
   const block = SCAN_SRC.slice(gateIdx, gateIdx + 300);
   assert.match(block, /if\s*\(geography\.state !== 'REMOTE_US' && geography\.state !== 'NYC_COMPATIBLE'\)\s*\{\s*totalFilteredLocation\+\+;\s*continue;\s*\}/);
 });
 
 test('the gate runs strictly before every downstream filter, dedup check, and the newOffers push', () => {
-  const gateIdx = SCAN_SRC.indexOf('const geography = classifyGeography(job);');
+  const gateIdx = SCAN_SRC.indexOf('const geography = classifyGeography(job, resolveJobDescriptionText(job));');
   const downstreamMarkers = [
     'postingAgeFilter(job.postedAt)',
     'postedDateFilter(job.postedAt)',
@@ -69,14 +69,14 @@ test('the gate runs strictly before every downstream filter, dedup check, and th
 
 test('the gate runs strictly after title_filter (title_filter is never weakened or bypassed)', () => {
   const titleFilterIdx = SCAN_SRC.indexOf("if (!titleFilter(job.title)) {");
-  const gateIdx = SCAN_SRC.indexOf('const geography = classifyGeography(job);');
+  const gateIdx = SCAN_SRC.indexOf('const geography = classifyGeography(job, resolveJobDescriptionText(job));');
   assert.notEqual(titleFilterIdx, -1);
   assert.notEqual(gateIdx, -1);
   assert.ok(titleFilterIdx < gateIdx, 'title_filter must still run first — this change must never reorder it');
 });
 
 test('the old location_filter() call no longer runs at this gate position (superseded by classifyGeography, per the 2026-09-13 policy)', () => {
-  const gateIdx = SCAN_SRC.indexOf('const geography = classifyGeography(job);');
+  const gateIdx = SCAN_SRC.indexOf('const geography = classifyGeography(job, resolveJobDescriptionText(job));');
   const nextStageIdx = SCAN_SRC.indexOf('postingAgeFilter(job.postedAt)');
   const between = SCAN_SRC.slice(gateIdx, nextStageIdx);
   assert.doesNotMatch(between, /locationFilter\(job\.location/, 'location_filter() must not be called again between the geography gate and the next stage');
