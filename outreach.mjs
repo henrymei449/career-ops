@@ -93,8 +93,9 @@ import {
   buildApplicationPendingAction,
   sortFollowUpActions,
   actionId as followUpActionId,
+  NEXT_ACTIONS,
 } from './followup-schema.mjs';
-import { mapUiApplicationStatus } from './application-schema.mjs';
+import { mapUiApplicationStatus, HIRING_STAGES, isKnownHiringStage } from './application-schema.mjs';
 
 // Reuses the plugin engine's own dotenv loader (plugins/_engine.mjs) rather
 // than a second copy: it reads .env from the resolved Data Root
@@ -529,6 +530,83 @@ export async function skipFollowUpAction(targetActionId, { root = DATA_ROOT } = 
     atomicWriteFile(p.statePath, JSON.stringify(state, null, 2) + '\n');
     return { job_key: target.jobKey, contact: { ...contact } };
   });
+}
+
+/**
+ * Home inline editing: change a real contact's next_action/next_action_due
+ * directly — the same two fields deriveBucket() (followup-schema.mjs) reads
+ * to compute that contact's OVERDUE/TODAY/UPCOMING/WAITING bucket, so Status
+ * recomputes on the very next read with no separate step. Resolves
+ * targetActionId via the identical one-way-hash lookup completeFollowUpAction
+ * /skipFollowUpAction already use (findFollowUpTarget), so this can only ever
+ * touch the ONE contact that action_id names — a job's other (folded)
+ * contacts are untouched by construction, not by convention.
+ *
+ * A synthetic APPLICATION_PENDING row's 'ap-' id never resolves here (it
+ * names no selected_contacts entry), so this correctly refuses to invent a
+ * contact for a job that has none — the caller (ui-server.mjs's route) is
+ * expected to only offer this control on a row with a real contact_id.
+ *
+ * `nextAction === null` clears both fields together — a due date with no
+ * action is display-meaningless (nothing would show in Home's "Next Action"
+ * column to explain why a date is there), so there is no canonical reason
+ * to keep one without the other, per this pass's stated default.
+ *
+ * @param {string} targetActionId
+ * @param {{nextAction: string|null, nextActionDue?: string|null}} edit
+ */
+export async function updateFollowUpAction(targetActionId, { nextAction, nextActionDue = null }, { root = DATA_ROOT } = {}) {
+  if (nextAction !== null && !NEXT_ACTIONS.includes(nextAction)) {
+    throw new Error(`outreach: updateFollowUpAction invalid next_action "${nextAction}" — must be one of ${NEXT_ACTIONS.join(', ')}, or null`);
+  }
+  const due = nextAction === null ? null : (nextActionDue || null);
+  if (due !== null) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(due) || Number.isNaN(new Date(`${due}T00:00:00`).getTime())) {
+      throw new Error(`outreach: updateFollowUpAction next_action_due "${due}" is not a valid YYYY-MM-DD date`);
+    }
+  }
+  const p = reviewPaths(root);
+  return withPipelineLock(p.statePath, async () => {
+    const state = readJson(p.statePath, defaultState());
+    const target = findFollowUpTarget(state, targetActionId);
+    if (!target) throw new Error(`follow-up: no action found for action_id ${targetActionId}`);
+    const job = state.jobs[target.jobKey];
+    const contact = withContactActionDefaults(job.outreach.selected_contacts[target.index]);
+    contact.next_action = nextAction;
+    contact.next_action_due = due;
+    contact.last_action_at = new Date().toISOString();
+    job.outreach.selected_contacts[target.index] = contact;
+    state.updated_at = new Date().toISOString();
+    atomicWriteFile(p.statePath, JSON.stringify(state, null, 2) + '\n');
+    return { job_key: target.jobKey, contact: { ...contact } };
+  });
+}
+
+/**
+ * Home inline editing: change a job's hiring-process stage
+ * (application_stage) from Home without touching application_status/outcome
+ * — a deliberately narrower sibling of updateApplicationStatus() above, for
+ * the axis this pass actually needs to edit. `stage` must be one of
+ * application-schema.mjs's HIRING_STAGES (isKnownHiringStage) — an existing
+ * out-of-list value (e.g. a historical "Recruiter Routing") is left exactly
+ * as-is unless the caller explicitly requests one of the canonical stages;
+ * this function never invents a wider stage vocabulary or a new stage-state
+ * engine, it only ever writes the one flat field.
+ *
+ * @param {string} jobKey
+ * @param {string} stage - one of HIRING_STAGES
+ */
+export async function updateApplicationStage(jobKey, stage, { root = DATA_ROOT } = {}) {
+  if (!isKnownHiringStage(stage)) {
+    throw new Error(`outreach: updateApplicationStage invalid stage "${stage}" — must be one of ${HIRING_STAGES.join(', ')}`);
+  }
+  return withJobState(jobKey, (job) => {
+    if (job.execution_status !== 'APPLIED') {
+      throw new Error(`outreach: ${jobKey} has execution_status=${job.execution_status}, not APPLIED — cannot update stage`);
+    }
+    job.application_stage = stage;
+    return { job_key: jobKey, application_stage: job.application_stage };
+  }, { root });
 }
 
 /**

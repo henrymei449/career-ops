@@ -606,6 +606,24 @@ function formatFollowUpLabel(row) {
   return due.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
+// Same local-date arithmetic as todayLocalStr() (n=0), generalized for the
+// Tomorrow/+3 days/+7 days quick actions below — client-side date math only,
+// the server still validates the resulting YYYY-MM-DD string on save.
+function addDaysLocalStr(days) {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  const localMs = d.getTime() - d.getTimezoneOffset() * 60000;
+  return new Date(localMs).toISOString().slice(0, 10);
+}
+
+// Inline editing vocab (Pass 6) — deliberately the SAME closed lists the
+// backend validates against (followup-schema.mjs's NEXT_ACTIONS,
+// application-schema.mjs's HIRING_STAGES), duplicated here only because this
+// is a plain script with no shared import into the browser. Keep in sync by
+// hand if either list changes.
+const NEXT_ACTION_OPTIONS = ['—', 'FOLLOW_UP', 'CHECK_CONNECTION', 'SEND_EMAIL', 'SEND_MESSAGE'];
+const HIRING_STAGE_OPTIONS = ['Applied', 'Recruiter Screen', 'Hiring Manager', 'Interview', 'Final', 'Offer'];
+
 async function loadFollowup() {
   const countsEl = $('#followup-counts');
   const listEl = $('#followup-list');
@@ -665,12 +683,13 @@ function renderHomeRow(row) {
     const grid = el('div', { class: 'fu-detail-grid' }, [
       el('div', {}, [el('span', { text: 'Company / Role:' }), document.createTextNode(`${row.company || '(unknown)'} — ${row.role || '(unknown)'}`)]),
       el('div', {}, [el('span', { text: 'Applied:' }), document.createTextNode(formatAppliedLabel(row))]),
-      el('div', {}, [el('span', { text: 'Stage:' }), document.createTextNode(row.application_stage || '(unknown)')]),
+      el('div', { onclick: (ev) => ev.stopPropagation() }, [el('span', { text: 'Stage:' }), renderStageControl(row, detailCell)]),
+      // Status stays derived/read-only (spec section 6) — never a control here.
       el('div', {}, [el('span', { text: 'Status:' }), document.createTextNode(row.status)]),
-      el('div', {}, [el('span', { text: 'Next action:' }), document.createTextNode(row.next_action || '—')]),
-      el('div', {}, [el('span', { text: 'Follow-up:' }), document.createTextNode(formatFollowUpLabel(row))]),
     ]);
-    const btnRow = el('div', { class: 'row' });
+    detailCell.appendChild(grid);
+    detailCell.appendChild(renderActionControl(row, detailCell));
+    const btnRow = el('div', { class: 'row', style: 'margin-top:10px' });
     btnRow.appendChild(el('button', {
       class: 'action',
       text: 'Open Application',
@@ -694,13 +713,98 @@ function renderHomeRow(row) {
         setView('outreach');
       },
     }));
-    detailCell.appendChild(grid);
     detailCell.appendChild(btnRow);
     detailCell.appendChild(renderHomeContacts(row, detailCell));
     const detailRow = el('tr', { class: 'fu-detail' }, detailCell);
     rows.push(detailRow);
   }
   return rows;
+}
+
+// Inline Stage editor (Pass 6): POST /api/home/stage/update — the smallest
+// sibling of Applications' Update Status, editing only application_stage.
+// Works identically whether the row has a real contact or is the synthetic
+// fallback (Salsify-shape) — Stage lives on the job, never on a contact.
+// A stage already outside HIRING_STAGE_OPTIONS (e.g. a historical
+// "Recruiter Routing") is offered as its own extra option so it displays
+// correctly and is never silently overwritten by re-selecting it.
+function renderStageControl(row, detailCell) {
+  const select = el('select', {
+    onchange: async (ev) => {
+      const value = ev.target.value;
+      if (value === row.application_stage) return;
+      select.disabled = true;
+      try { await api('POST', '/api/home/stage/update', { job_key: row.job_key, stage: value }); loadFollowup(); }
+      catch (e) { select.disabled = false; select.value = row.application_stage || 'Applied'; showError(detailCell, e.message); }
+    },
+  });
+  const known = HIRING_STAGE_OPTIONS.includes(row.application_stage);
+  if (!known && row.application_stage) {
+    select.appendChild(el('option', { value: row.application_stage, text: `${row.application_stage} (current)` }));
+  }
+  for (const stage of HIRING_STAGE_OPTIONS) select.appendChild(el('option', { value: stage, text: stage }));
+  select.value = row.application_stage || 'Applied';
+  return select;
+}
+
+// Inline Next Action / Follow-up editor (Pass 6): POST /api/home/action/update
+// — mutates ONLY row.action_id, the same id Mark Done/Skip already resolve
+// against (outreach.mjs's findFollowUpTarget), so this can never touch a
+// job's other (folded) contacts. Disabled entirely when the row has no real
+// contact (row.contact_id == null, the synthetic APPLICATION_PENDING
+// fallback) — per this pass's explicit scope limit, editing a job-level
+// action with no contact to own it would require a generalized task model
+// this pass does not build; Stage is still editable in that case (see
+// renderStageControl above), just not Next Action/Follow-up.
+function renderActionControl(row, detailCell) {
+  if (row.contact_id == null) {
+    return el('div', { class: 'meta', style: 'margin:8px 0' },
+      document.createTextNode('No contact action yet — set Stage above, or add a contact from Outreach. (Editing a job-level action with no contact isn’t supported in this pass.)'));
+  }
+
+  const actionSelect = el('select', {});
+  for (const opt of NEXT_ACTION_OPTIONS) actionSelect.appendChild(el('option', { value: opt === '—' ? '' : opt, text: opt }));
+  actionSelect.value = row.next_action || '';
+
+  const dateInput = el('input', { type: 'date' });
+  if (row.due_at) dateInput.value = row.due_at;
+
+  async function save(nextAction, nextActionDue) {
+    try {
+      await api('POST', '/api/home/action/update', { action_id: row.action_id, next_action: nextAction, next_action_due: nextActionDue });
+      loadFollowup();
+    } catch (e) { showError(detailCell, e.message); }
+  }
+
+  actionSelect.addEventListener('change', (ev) => {
+    const value = ev.target.value || null;
+    save(value, value === null ? null : (dateInput.value || row.due_at || null));
+  });
+  dateInput.addEventListener('change', (ev) => {
+    save(actionSelect.value || row.next_action || 'FOLLOW_UP', ev.target.value || null);
+  });
+
+  function quickBtn(label, days) {
+    return el('button', {
+      class: 'action',
+      text: label,
+      onclick: (ev) => { ev.stopPropagation(); save(actionSelect.value || row.next_action || 'FOLLOW_UP', addDaysLocalStr(days)); },
+    });
+  }
+
+  const wrap = el('div', { onclick: (ev) => ev.stopPropagation(), style: 'margin:10px 0' });
+  wrap.appendChild(el('div', { class: 'row', style: 'gap:8px;align-items:center' }, [
+    el('span', { class: 'meta', text: 'Next action:' }), actionSelect,
+    el('span', { class: 'meta', text: 'Follow-up:' }), dateInput,
+  ]));
+  const quickRow = el('div', { class: 'row', style: 'margin-top:6px;gap:6px' }, [
+    quickBtn('Tomorrow', 1),
+    quickBtn('+3 days', 3),
+    quickBtn('+7 days', 7),
+    el('button', { class: 'action', text: 'Clear', onclick: (ev) => { ev.stopPropagation(); save(null, null); } }),
+  ]);
+  wrap.appendChild(quickRow);
+  return wrap;
 }
 
 // Person/channel/contact-status live only inside the expanded row — Home's

@@ -31,6 +31,24 @@ export const APPLICATION_CLOSED_STATUSES = ['REJECTED', 'CLOSED', 'WITHDRAWN'];
 // explicitly set from this control.
 export const APPLICATION_UI_STATUSES = ['ACTIVE', 'REJECTED', 'ROLE_CLOSED', 'WITHDRAWN'];
 
+// Home inline editing (job-level hiring-process stage, a different axis from
+// application_status above): the smallest controlled vocabulary for "where
+// is this application in the hiring process" — deliberately not merged with
+// APPLICATION_STATUSES/APPLICATION_UI_STATUSES, which describe whether the
+// application is still alive, not how far it has progressed. A job's
+// application_stage may already hold a value outside this list (set by
+// mapUiApplicationStatus's REJECTED/CLOSED/WITHDRAWN stages, or by a
+// historical migration's free-text stage_raw) — isKnownHiringStage() lets a
+// caller tell "one of the editable canonical stages" from "an existing value
+// to preserve/display as-is," so Home's stage editor never silently
+// overwrites a value it doesn't recognize.
+export const HIRING_STAGES = ['Applied', 'Recruiter Screen', 'Hiring Manager', 'Interview', 'Final', 'Offer'];
+
+/** @param {string} stage @returns {boolean} */
+export function isKnownHiringStage(stage) {
+  return HIRING_STAGES.includes(stage);
+}
+
 /**
  * Map one Pass 5 "Update Status" UI choice to the canonical application_status
  * / application_outcome / application_stage triple. Conservative and

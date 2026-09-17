@@ -46,6 +46,8 @@ import {
   completeFollowUpAction,
   skipFollowUpAction,
   updateApplicationStatus,
+  updateFollowUpAction,
+  updateApplicationStage,
 } from './outreach.mjs';
 import { intakeJob } from './adhoc-intake.mjs';
 import { APPLICATION_ALIVE_STATUSES, APPLICATION_CLOSED_STATUSES } from './application-schema.mjs';
@@ -372,6 +374,27 @@ const API_ROUTES = [
     if (!actionId) throw new Error('action_id required');
     const { job_key: jobKey, contact } = await skipFollowUpAction(actionId, { root: DATA_ROOT });
     return { job_key: jobKey, contact };
+  }],
+  // Home inline editing (Pass 6): edit a row's primary Next Action/Follow-up
+  // in place, without a detour through the Outreach tab. `action_id` is the
+  // SAME id Mark Done/Skip already use — it names exactly one contact via
+  // outreach.mjs's one-way hash lookup, so this can never touch a job's other
+  // (folded) contacts. `next_action: null` clears the due date too (see
+  // updateFollowUpAction's own doc comment for why).
+  ['POST', '/api/home/action/update', async (body) => {
+    const { action_id: actionId, next_action: nextAction = null, next_action_due: nextActionDue = null } = body;
+    if (!actionId) throw new Error('action_id required');
+    const { job_key: jobKey, contact } = await updateFollowUpAction(actionId, { nextAction, nextActionDue }, { root: DATA_ROOT });
+    return { job_key: jobKey, contact };
+  }],
+  // Home inline editing (Pass 6): edit a job's hiring-process stage. A
+  // narrower sibling of /api/applications/status — never touches
+  // application_status/outcome, only application_stage.
+  ['POST', '/api/home/stage/update', async (body) => {
+    const { job_key: jobKey, stage } = body;
+    if (!jobKey) throw new Error('job_key required');
+    if (!stage) throw new Error('stage required');
+    return updateApplicationStage(jobKey, stage, { root: DATA_ROOT });
   }],
   // Ad-hoc job intake (#pass3): paste-a-URL entry point into the SAME
   // review-batch pipeline every sourced job goes through. All capture/
