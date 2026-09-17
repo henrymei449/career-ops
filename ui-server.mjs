@@ -52,7 +52,7 @@ import {
 } from './outreach.mjs';
 import { intakeJob } from './adhoc-intake.mjs';
 import { APPLICATION_ALIVE_STATUSES, APPLICATION_CLOSED_STATUSES } from './application-schema.mjs';
-import { deriveOutreachCompletion, buildHomeRows } from './followup-schema.mjs';
+import { deriveOutreachCompletion, buildHomeRows, isOutreachNeeded } from './followup-schema.mjs';
 
 const DATA_ROOT = getCareerOpsRoot();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -132,12 +132,68 @@ function listReadyToApply() {
     }));
 }
 
-/** Every APPLIED job with its full outreach record (candidates included). */
-function listOutreachDetailed() {
+/**
+ * Every APPLIED job with its full outreach record (candidates included).
+ *
+ * `activeOnly` (default true) is the Outreach P0 cleanup default queue: an
+ * active execution queue, not a history dump. A record is suppressed when
+ * its application has closed (REJECTED/CLOSED/WITHDRAWN — same
+ * APPLICATION_ALIVE_STATUSES partition every other view uses) or its
+ * outreach has already reached COMPLETE (covers both a genuinely finished
+ * REQUIRED/OPTIONAL thread and a WAIVED decision, whose initial status is
+ * COMPLETE per outreach-schema.mjs). No history is deleted — this is a read
+ * filter only, same durable record either way.
+ */
+/**
+ * READY_TO_APPLY jobs shaped as Home rows (one-shot Home extension): a job
+ * whose review is finalized APPLY but not yet submitted. Deliberately built
+ * as a SEPARATE list from buildHomeRows()/listFollowUpActions() rather than
+ * folded into that function — home-application-coverage.test.mjs locks in
+ * "non-APPLIED jobs (READY_TO_APPLY, NONE, NOT_APPLYING) never appear on
+ * Home" for that read path, so a READY_TO_APPLY row is a distinct kind the
+ * client merges in for the READY TO APPLY / ALL ACTIVE filters, never a
+ * disguised APPLIED row (no applied_at, no bucket/status the follow-up
+ * vocabulary defines — `home_kind: 'READY_TO_APPLY'` is how the client tells
+ * the two apart).
+ */
+function readyRowsForHome() {
+  return listReadyToApply().map((job) => ({
+    job_key: job.job_key,
+    company: job.company,
+    role: job.title,
+    url: job.url,
+    applied_at: null,
+    application_stage: null,
+    application_status: null,
+    priority: null,
+    last_touch: null,
+    waiting_on: null,
+    notes: null,
+    next_action: null,
+    due_at: null,
+    bucket: null,
+    outreach_decision: null,
+    outreach_status: null,
+    outreach_needed: false,
+    action_id: null,
+    contact_id: null,
+    extra_count: 0,
+    actions: [],
+    status: 'READY TO APPLY',
+    home_kind: 'READY_TO_APPLY',
+  }));
+}
+
+function listOutreachDetailed({ activeOnly = true } = {}) {
   const p = reviewPaths(DATA_ROOT);
   const state = readJson(p.statePath, defaultState());
   return Object.entries(state.jobs)
     .filter(([, job]) => job.outreach)
+    .filter(([, job]) => {
+      if (!activeOnly) return true;
+      if (!APPLICATION_ALIVE_STATUSES.includes(effectiveApplicationStatus(job))) return false;
+      return job.outreach.status !== 'COMPLETE';
+    })
     .map(([jobKey, job]) => ({
       job_key: jobKey,
       company: job.company,
@@ -362,7 +418,11 @@ const API_ROUTES = [
   // real per-contact action_ids.
   ['GET', '/api/followup', async () => {
     const actions = listFollowUpActions();
-    return { actions, home_rows: buildHomeRows(actions) };
+    const homeRows = buildHomeRows(actions).map((row) => ({
+      ...row,
+      outreach_needed: isOutreachNeeded(row.outreach_decision, row.outreach_status),
+    }));
+    return { actions, home_rows: homeRows, ready_rows: readyRowsForHome() };
   }],
   ['POST', '/api/followup/complete', async (body) => {
     const { action_id: actionId } = body;

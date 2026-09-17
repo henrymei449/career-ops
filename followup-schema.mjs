@@ -142,6 +142,8 @@ export function buildFollowUpAction({ jobKey, job, contact, todayStr }) {
     application_stage: job.application_stage || 'Applied',
     applied_at: job.applied_at || null,
     operating: withOperatingDefaults(job.operating),
+    outreach_decision: job.outreach?.decision || null,
+    outreach_status: job.outreach?.status || null,
   };
 }
 
@@ -196,7 +198,25 @@ export function buildApplicationPendingAction({ jobKey, job }) {
     application_stage: job.application_stage || 'Applied',
     applied_at: job.applied_at || null,
     operating: withOperatingDefaults(job.operating),
+    outreach_decision: job.outreach?.decision || null,
+    outreach_status: job.outreach?.status || null,
   };
+}
+
+/**
+ * Whether a job's outreach needs operator attention — the single predicate
+ * shared by Home's OUTREACH NEEDED filter and the Outreach page's default
+ * active-queue filter (AGENTS.md one-shot spec, Home section + Outreach P0
+ * section): decision is REQUIRED or OPTIONAL (never PENDING — undecided is
+ * not yet "needed", it is a decision to make first) and outreach hasn't
+ * already reached COMPLETE (which also covers WAIVED, whose initial status
+ * per outreach-schema.mjs's DECISION_INITIAL_STATUS is COMPLETE).
+ *
+ * @param {string|null} decision
+ * @param {string|null} status
+ */
+export function isOutreachNeeded(decision, status) {
+  return (decision === 'REQUIRED' || decision === 'OPTIONAL') && status !== 'COMPLETE';
 }
 
 const BUCKET_ORDER = { OVERDUE: 0, TODAY: 1, UPCOMING: 2, WAITING: 3 };
@@ -419,6 +439,9 @@ export function buildHomeRows(actions, todayStr = localToday()) {
       contact_id: primary.contact_id,
       extra_count: jobActions.length - 1,
       actions: sortFollowUpActions(jobActions),
+      outreach_decision: primary.outreach_decision,
+      outreach_status: primary.outreach_status,
+      home_kind: 'APPLIED',
     };
     row.status = deriveHomeStatus(row);
     rows.push(row);

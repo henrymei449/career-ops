@@ -8,10 +8,12 @@ const state = {
   view: 'followup',
   reviewSelections: {}, // job_key -> 'APPLY' | 'INVESTIGATE' | 'PASS'
   outreachSelections: {}, // job_key -> Set(candidate_id)
+  outreachEditing: {}, // job_key -> true while explicitly re-opened for contact re-selection
   selectedBatchId: null, // Review tab's currently selected open batch
   applicationsFilter: 'alive', // Applications tab's currently selected filter
   followupExpanded: null, // job_key of the currently expanded Home row, or null
-  homeFilter: null, // one of HOME_FILTER_BUCKETS, or null for "All"
+  homeFilter: null, // one of HOME_TOP_FILTERS' keys, or null for ALL_ACTIVE
+  homeAppliedBucket: null, // one of HOME_APPLIED_BUCKETS' keys, or null for all Applied rows
   applicationsHighlightKey: null, // job_key to scroll to/highlight after Open Application
   outreachHighlightKey: null, // job_key to scroll to/highlight after Open Outreach
 };
@@ -538,6 +540,32 @@ function renderOutreachCard(job) {
     return card;
   }
 
+  // Outreach P0 cleanup: once contacts are selected, show the EXECUTION
+  // STATE (who was picked, what's next) rather than re-presenting the full
+  // candidate pool every time — the operator already made this decision.
+  // Editing re-enters discovery mode only on explicit request (state.
+  // outreachEditing), never automatically. CANDIDATES_FOUND (nothing chosen
+  // yet) always shows the picker — there is no execution state to summarize.
+  if (job.status === 'CONTACTS_SELECTED' && !state.outreachEditing[job.job_key]) {
+    for (const c of job.selected_contacts || []) {
+      const line = el('div', { class: 'row', style: 'margin-bottom:6px;align-items:center' });
+      line.appendChild(document.createTextNode(
+        `${c.name || '(name unknown)'} — ${c.title || '(title unknown)'}${c.company ? ' @ ' + c.company : ''} · ${c.status || 'CONTACT_SELECTED'}${c.next_action ? ` · next: ${c.next_action}${c.next_action_due ? ` (${c.next_action_due})` : ''}` : ''}`
+      ));
+      if (c.linkedin_url) line.appendChild(el('a', { href: c.linkedin_url, target: '_blank', rel: 'noopener', text: 'LinkedIn', style: 'margin-left:8px' }));
+      card.appendChild(line);
+    }
+    card.appendChild(el('div', { class: 'meta', text: 'Per-contact follow-up (channel, next action, mark done/skip) is managed from Home.', style: 'margin-top:6px' }));
+    card.appendChild(el('div', { class: 'row', style: 'margin-top:10px' }, [
+      el('button', {
+        class: 'action',
+        text: 'Edit Selection',
+        onclick: () => { state.outreachEditing[job.job_key] = true; loadOutreach(); },
+      }),
+    ]));
+    return card;
+  }
+
   if (job.status === 'CANDIDATES_FOUND' || job.status === 'CONTACTS_SELECTED') {
     const selected = state.outreachSelections[job.job_key] || new Set((job.selected_contacts || []).map((c) => c.candidate_id));
     state.outreachSelections[job.job_key] = selected;
@@ -569,18 +597,34 @@ function renderOutreachCard(job) {
       }
     }
 
-    card.appendChild(el('div', { class: 'row', style: 'margin-top:10px' }, [
-      el('button', {
-        class: 'action primary',
-        text: 'Save Selected Contacts',
-        onclick: async () => {
-          const ids = Array.from(selected);
-          if (ids.length === 0) { showError(card, 'Select at least one contact first.'); return; }
-          try { await api('POST', '/api/outreach/select', { job_key: job.job_key, candidate_ids: ids }); loadOutreach(); }
-          catch (e) { showError(card, e.message); }
-        },
-      }),
-    ]));
+    // Save Selected Contacts (P0 fix): the save itself always worked — the
+    // defect was that a successful save produced NO visible feedback before
+    // loadOutreach() rebuilt this exact card with the same lane/checkbox
+    // layout (CANDIDATES_FOUND and CONTACTS_SELECTED render identically
+    // apart from a small meta line), so a click looked like it did nothing.
+    // Show an explicit "Saved" status (same statusEl pattern as
+    // renderOperatingControls' Save Changes) and hold it on screen briefly
+    // before the reload, so the state change is visible, not just true.
+    const saveBtn = el('button', { class: 'action primary', text: 'Save Selected Contacts' });
+    const saveStatusEl = el('span', { class: 'meta', style: 'margin-left:8px' });
+    saveBtn.addEventListener('click', async () => {
+      const ids = Array.from(selected);
+      if (ids.length === 0) { showError(card, 'Select at least one contact first.'); return; }
+      saveBtn.disabled = true;
+      saveStatusEl.textContent = 'Saving…';
+      try {
+        await api('POST', '/api/outreach/select', { job_key: job.job_key, candidate_ids: ids });
+        saveStatusEl.textContent = `Saved — ${ids.length} contact${ids.length === 1 ? '' : 's'} selected`;
+        delete state.outreachEditing[job.job_key]; // saved -> back to the execution-state summary, not left open in discovery mode
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        loadOutreach();
+      } catch (e) {
+        saveBtn.disabled = false;
+        saveStatusEl.textContent = '';
+        showError(card, e.message);
+      }
+    });
+    card.appendChild(el('div', { class: 'row', style: 'margin-top:10px' }, [saveBtn, saveStatusEl]));
   }
 
   return card;
@@ -634,7 +678,114 @@ const NEXT_ACTION_OPTIONS = ['—', 'FOLLOW_UP', 'CHECK_CONNECTION', 'SEND_EMAIL
 const HIRING_STAGE_OPTIONS = ['Applied', 'Recruiter Screen', 'Hiring Manager', 'Interview', 'Final', 'Offer'];
 // Same closed vocab as followup-schema.mjs's OPERATING_PRIORITIES.
 const PRIORITY_OPTIONS = ['—', 'P0', 'P1', 'P2', 'P3'];
-const HOME_FILTER_BUCKETS = ['TODAY', 'OVERDUE', 'UPCOMING', 'WAITING'];
+
+// Home top-level filters (one-shot spec section A). Each maps to a
+// predicate over the combined home_rows + ready_rows list — see
+// homeFilterPredicate(). APPLIED gets its own time-bucket sub-filter
+// (HOME_APPLIED_BUCKETS below), never a second top-level chip row.
+const HOME_TOP_FILTERS = [
+  ['ALL_ACTIVE', 'All Active'],
+  ['READY_TO_APPLY', 'Ready to Apply'],
+  ['OUTREACH_NEEDED', 'Outreach Needed'],
+  ['WAITING', 'Waiting'],
+  ['DUE_OVERDUE', 'Due / Overdue'],
+  ['APPLIED', 'Applied'],
+];
+const HOME_APPLIED_BUCKETS = [
+  ['TODAY', 'Today'],
+  ['THIS_WEEK', 'This Week'],
+  ['LAST_WEEK', 'Last Week'],
+  ['OLDER', '>2 Weeks'],
+];
+
+/** Monday-start local calendar-week key (YYYY-MM-DD of that week's Monday) for a YYYY-MM-DD date string. */
+function weekKeyLocal(dateStr) {
+  const d = new Date(`${dateStr}T00:00:00`);
+  const dow = (d.getDay() + 6) % 7; // Mon=0 .. Sun=6
+  d.setDate(d.getDate() - dow);
+  return d.toISOString().slice(0, 10);
+}
+
+/** Which HOME_APPLIED_BUCKETS bucket an applied_at timestamp falls in, relative to todayStr (YYYY-MM-DD). */
+function appliedTimeBucket(appliedAt, todayStr) {
+  if (!appliedAt) return null;
+  const appliedDateStr = new Date(appliedAt).toISOString().slice(0, 10);
+  if (appliedDateStr === todayStr) return 'TODAY';
+  const thisWeekKey = weekKeyLocal(todayStr);
+  if (weekKeyLocal(appliedDateStr) === thisWeekKey) return 'THIS_WEEK';
+  const lastWeekAnchor = new Date(`${thisWeekKey}T00:00:00`);
+  lastWeekAnchor.setDate(lastWeekAnchor.getDate() - 7);
+  if (weekKeyLocal(appliedDateStr) === lastWeekAnchor.toISOString().slice(0, 10)) return 'LAST_WEEK';
+  return 'OLDER';
+}
+
+/** Short "Applied Nd ago" / "Waiting Nd" / "Overdue Nd" / etc. operator-facing age text — display only, derived from existing fields. */
+function rowAgeText(row, todayStr) {
+  if (row.home_kind === 'READY_TO_APPLY') return 'Ready to apply';
+  const daysBetween = (a, b) => Math.round((new Date(`${b}T00:00:00`) - new Date(`${a}T00:00:00`)) / 86400000);
+  if (row.bucket === 'OVERDUE' && row.due_at) return `Overdue ${daysBetween(row.due_at, todayStr)}d`;
+  if (row.bucket === 'TODAY') return 'Follow-up due today';
+  if (row.bucket === 'UPCOMING' && row.due_at) return `Due in ${daysBetween(todayStr, row.due_at)}d`;
+  if (row.contact_id == null && row.outreach_needed) return 'Outreach not started';
+  if (row.applied_at) {
+    const appliedDateStr = new Date(row.applied_at).toISOString().slice(0, 10);
+    const age = daysBetween(appliedDateStr, todayStr);
+    return age <= 0 ? 'Applied today' : `Applied ${age}d ago`;
+  }
+  return '—';
+}
+
+/** Predicate for one HOME_TOP_FILTERS entry over a combined home/ready row. */
+function homeFilterPredicate(filterKey, row) {
+  switch (filterKey) {
+    case 'READY_TO_APPLY': return row.home_kind === 'READY_TO_APPLY';
+    case 'OUTREACH_NEEDED': return !!row.outreach_needed;
+    case 'WAITING': return row.bucket === 'WAITING';
+    case 'DUE_OVERDUE': return row.bucket === 'OVERDUE' || row.bucket === 'TODAY' || row.bucket === 'UPCOMING';
+    case 'APPLIED': return row.home_kind === 'APPLIED';
+    case 'ALL_ACTIVE':
+    default: return true;
+  }
+}
+
+// Urgency rank for the default ALL ACTIVE sort (spec section C): OVERDUE ->
+// TODAY -> READY TO APPLY -> OUTREACH NEEDED -> WAITING/aging -> everything
+// else. A row can match more than one tier (e.g. an OVERDUE row that also
+// needs outreach) — it sorts by the FIRST tier it qualifies for.
+function urgencyRank(row) {
+  if (row.bucket === 'OVERDUE') return 0;
+  if (row.bucket === 'TODAY') return 1;
+  if (row.home_kind === 'READY_TO_APPLY') return 2;
+  if (row.outreach_needed) return 3;
+  if (row.bucket === 'WAITING') return 4;
+  return 5;
+}
+
+function sortHomeRowsForDisplay(rows, filterKey) {
+  const sorted = [...rows];
+  if (filterKey === 'APPLIED') {
+    // Applied recent views: newest applied first.
+    sorted.sort((a, b) => String(b.applied_at || '').localeCompare(String(a.applied_at || '')) || a.job_key.localeCompare(b.job_key));
+    return sorted;
+  }
+  if (filterKey === 'WAITING') {
+    // Within WAITING: oldest waiting (earliest applied_at) first.
+    sorted.sort((a, b) => String(a.applied_at || '').localeCompare(String(b.applied_at || '')) || a.job_key.localeCompare(b.job_key));
+    return sorted;
+  }
+  // Default (ALL ACTIVE and every other filter): urgency tier, then due
+  // date, then oldest-applied-first as the WAITING tie-break, then job_key.
+  sorted.sort((a, b) => {
+    const cmp = urgencyRank(a) - urgencyRank(b);
+    if (cmp !== 0) return cmp;
+    const dueCmp = String(a.due_at || '').localeCompare(String(b.due_at || ''));
+    if (dueCmp !== 0) return dueCmp;
+    const appliedCmp = String(a.applied_at || '').localeCompare(String(b.applied_at || ''));
+    if (appliedCmp !== 0) return appliedCmp;
+    return a.job_key.localeCompare(b.job_key);
+  });
+  return sorted;
+}
 
 async function loadFollowup() {
   const countsEl = $('#followup-counts');
@@ -645,31 +796,47 @@ async function loadFollowup() {
   try { data = await api('GET', '/api/followup'); }
   catch (e) { listEl.innerHTML = ''; showError(listEl, e.message); return; }
 
-  const allRows = data.home_rows || [];
-  const counts = { OVERDUE: 0, TODAY: 0, UPCOMING: 0, WAITING: 0 };
-  for (const r of allRows) counts[r.bucket] = (counts[r.bucket] || 0) + 1;
+  const todayStr = todayLocalStr();
+  // ALL ACTIVE's own working set: every live job — an applied job (real or
+  // fallback row) plus every READY_TO_APPLY job. Both are already suppressed
+  // upstream for terminal states (see readOutreach/home-row builders and
+  // ui-server.mjs's readyRowsForHome/listReadyToApply), so no further
+  // REJECTED/CLOSED/WITHDRAWN/NOT_APPLYING filtering is needed here.
+  const allRows = [...(data.home_rows || []), ...(data.ready_rows || [])];
 
-  // Trivial bucket filters (spec section 8) — chips are counts AND filter
-  // toggles over the same allRows the counts are computed from, so the
-  // numbers shown never drift from what "All" would list. Clicking the
-  // already-selected chip clears back to All, same toggle-off pattern the
-  // Applications tab does not use but Home's own single-select warrants
-  // since there is no separate "All" button state to fall back to otherwise.
-  const chipDefs = [['TODAY', 'Today'], ['OVERDUE', 'Overdue'], ['UPCOMING', 'Upcoming'], ['WAITING', 'Waiting']];
-  countsEl.appendChild(el('button', {
-    class: `fu-chip all${state.homeFilter === null ? ' selected' : ''}`,
-    onclick: () => { state.homeFilter = null; loadFollowup(); },
-  }, [el('span', { text: 'All' }), el('b', { text: String(allRows.length) })]));
-  for (const [bucket, label] of chipDefs) {
-    countsEl.appendChild(el('button', {
-      class: `fu-chip ${bucket.toLowerCase()}${state.homeFilter === bucket ? ' selected' : ''}`,
-      onclick: () => { state.homeFilter = state.homeFilter === bucket ? null : bucket; loadFollowup(); },
-    }, [el('span', { text: label }), el('b', { text: String(counts[bucket]) })]));
+  const filterCounts = {};
+  for (const [key] of HOME_TOP_FILTERS) filterCounts[key] = allRows.filter((r) => homeFilterPredicate(key, r)).length;
+  const appliedRows = allRows.filter((r) => r.home_kind === 'APPLIED');
+  const appliedBucketCounts = {};
+  for (const [key] of HOME_APPLIED_BUCKETS) {
+    appliedBucketCounts[key] = appliedRows.filter((r) => appliedTimeBucket(r.applied_at, todayStr) === key).length;
   }
 
-  const rows = state.homeFilter ? allRows.filter((r) => r.bucket === state.homeFilter) : allRows;
+  const activeFilter = state.homeFilter || 'ALL_ACTIVE';
+  for (const [key, label] of HOME_TOP_FILTERS) {
+    countsEl.appendChild(el('button', {
+      class: `fu-chip ${key.toLowerCase()}${activeFilter === key ? ' selected' : ''}`,
+      onclick: () => { state.homeFilter = key === 'ALL_ACTIVE' ? null : key; state.homeAppliedBucket = null; loadFollowup(); },
+    }, [el('span', { text: label }), el('b', { text: String(filterCounts[key]) })]));
+  }
+
+  let rows = allRows.filter((r) => homeFilterPredicate(activeFilter, r));
+
+  const appliedBucketRow = el('div', { class: 'row', style: 'margin:8px 0 14px' });
+  if (activeFilter === 'APPLIED') {
+    for (const [key, label] of HOME_APPLIED_BUCKETS) {
+      appliedBucketRow.appendChild(el('button', {
+        class: `fu-chip ${key.toLowerCase()}${state.homeAppliedBucket === key ? ' selected' : ''}`,
+        onclick: () => { state.homeAppliedBucket = state.homeAppliedBucket === key ? null : key; loadFollowup(); },
+      }, [el('span', { text: label }), el('b', { text: String(appliedBucketCounts[key]) })]));
+    }
+    if (state.homeAppliedBucket) rows = rows.filter((r) => appliedTimeBucket(r.applied_at, todayStr) === state.homeAppliedBucket);
+  }
+
+  rows = sortHomeRowsForDisplay(rows, activeFilter);
 
   listEl.innerHTML = '';
+  if (activeFilter === 'APPLIED') listEl.appendChild(appliedBucketRow);
   if (allRows.length === 0) {
     listEl.appendChild(el('p', { class: 'empty', text: 'Nothing needs action right now.' }));
     return;
@@ -684,17 +851,81 @@ async function loadFollowup() {
     el('th', { text: 'Priority' }), el('th', { text: 'Applied' }), el('th', { text: 'Company / Role' }),
     el('th', { text: 'Status' }), el('th', { text: 'Last Touch' }),
     el('th', { text: 'Next Action' }), el('th', { text: 'Waiting On' }), el('th', { text: 'Follow-up' }),
+    el('th', { text: 'Age' }),
   ]));
   table.appendChild(thead);
   const tbody = el('tbody');
   for (const row of rows) {
-    for (const r of renderHomeRow(row)) tbody.appendChild(r);
+    for (const r of renderHomeRow(row, todayStr)) tbody.appendChild(r);
   }
   table.appendChild(tbody);
   listEl.appendChild(table);
 }
 
-function renderHomeRow(row) {
+// READY_TO_APPLY rows (one-shot Home extension) render a much smaller
+// row/detail — they carry none of the applied-job fields (stage, operating,
+// contacts) — and reuse the EXACT Ready-to-Apply endpoints
+// (/api/ready/applied, /api/ready/pass) rather than inventing a second
+// mark-applied/pass code path. Same inline two-step confirm pattern as the
+// Ready to Apply tab (never window.confirm() — see loadReady()'s comment).
+function renderReadyHomeRow(row, todayStr) {
+  const tr = el('tr', { class: 'fu-row', 'data-job-key': row.job_key, onclick: () => {
+    state.followupExpanded = state.followupExpanded === row.job_key ? null : row.job_key;
+    loadFollowup();
+  } });
+  tr.appendChild(el('td', { text: '—' }));
+  tr.appendChild(el('td', { text: '—' }));
+  tr.appendChild(el('td', { text: `${row.company || '(company unknown)'} — ${row.role || '(role unknown)'}` }));
+  tr.appendChild(el('td', { text: 'READY TO APPLY' }));
+  tr.appendChild(el('td', { text: '—' }));
+  tr.appendChild(el('td', { text: '—' }));
+  tr.appendChild(el('td', { text: '—' }));
+  tr.appendChild(el('td', { text: '—' }));
+  tr.appendChild(el('td', { text: rowAgeText(row, todayStr) }));
+
+  const rows = [tr];
+  if (state.followupExpanded === row.job_key) {
+    const detailCell = el('td', { colspan: '9' });
+    if (row.url && /^https?:\/\//i.test(row.url)) {
+      detailCell.appendChild(el('div', { class: 'row', style: 'margin-bottom:10px' }, [
+        el('a', { href: row.url, target: '_blank', rel: 'noopener', class: 'action', text: 'Open Application' }),
+      ]));
+    }
+    const markBtn = el('button', { class: 'action primary', text: 'Mark Applied' });
+    markBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      if (markBtn.dataset.confirming === 'true') {
+        markBtn.disabled = true;
+        markBtn.textContent = 'Marking…';
+        api('POST', '/api/ready/applied', { job_key: row.job_key }).then(() => loadFollowup())
+          .catch((e) => { markBtn.disabled = false; markBtn.dataset.confirming = 'false'; markBtn.textContent = 'Mark Applied'; showError(detailCell, e.message); });
+        return;
+      }
+      markBtn.dataset.confirming = 'true';
+      markBtn.textContent = `Confirm: mark ${row.company} applied?`;
+    });
+    const passBtn = el('button', { class: 'action', text: 'Pass' });
+    passBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      if (passBtn.dataset.confirming === 'true') {
+        passBtn.disabled = true;
+        passBtn.textContent = 'Passing…';
+        api('POST', '/api/ready/pass', { job_key: row.job_key }).then(() => loadFollowup())
+          .catch((e) => { passBtn.disabled = false; passBtn.dataset.confirming = 'false'; passBtn.textContent = 'Pass'; showError(detailCell, e.message); });
+        return;
+      }
+      passBtn.dataset.confirming = 'true';
+      passBtn.textContent = 'Pass on this job?';
+    });
+    detailCell.appendChild(el('div', { class: 'row' }, [markBtn, passBtn]));
+    rows.push(el('tr', { class: 'fu-detail' }, detailCell));
+  }
+  return rows;
+}
+
+function renderHomeRow(row, todayStr) {
+  if (row.home_kind === 'READY_TO_APPLY') return renderReadyHomeRow(row, todayStr);
+
   const tr = el('tr', { class: 'fu-row', 'data-job-key': row.job_key, onclick: () => {
     state.followupExpanded = state.followupExpanded === row.job_key ? null : row.job_key;
     loadFollowup();
@@ -707,10 +938,11 @@ function renderHomeRow(row) {
   tr.appendChild(el('td', { text: (row.next_action || '—') + (row.extra_count > 0 ? ` (+${row.extra_count})` : '') }));
   tr.appendChild(el('td', { text: row.waiting_on || '—' }));
   tr.appendChild(el('td', { class: `fu-due-${row.bucket}`, text: formatFollowUpLabel(row) }));
+  tr.appendChild(el('td', { class: 'meta', text: rowAgeText(row, todayStr) }));
 
   const rows = [tr];
   if (state.followupExpanded === row.job_key) {
-    const detailCell = el('td', { colspan: '8' });
+    const detailCell = el('td', { colspan: '9' });
     const grid = el('div', { class: 'fu-detail-grid' }, [
       el('div', {}, [el('span', { text: 'Company / Role:' }), document.createTextNode(`${row.company || '(unknown)'} — ${row.role || '(unknown)'}`)]),
       el('div', {}, [el('span', { text: 'Applied:' }), document.createTextNode(formatAppliedLabel(row))]),
