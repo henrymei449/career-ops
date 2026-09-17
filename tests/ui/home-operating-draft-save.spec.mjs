@@ -86,22 +86,27 @@ test.afterEach(async () => {
   rmSync(dataRoot, { recursive: true, force: true });
 });
 
-/** Expand the (only) Home row and return its operating-section locators. */
+/** Expand the (only) Home row and return its operating-section locators.
+ * Priority now renders as a compact header badge next to Stage (card
+ * redesign — spec section 2), so it lives outside `.fu-operating`; Follow-Up
+ * Due sits in the action block and Last Touch in the context block below it,
+ * so the two date inputs are scoped by block rather than by document order. */
 async function expandRow(page) {
   await page.goto(BASE_URL);
   await page.locator(`tr.fu-row[data-job-key="${JOB_KEY}"]`).click();
-  const detail = page.locator('.fu-operating');
-  await expect(detail).toBeVisible();
+  const cell = page.locator('tr.fu-detail');
+  const operating = cell.locator('.fu-operating');
+  await expect(operating).toBeVisible();
   return {
-    priority: detail.locator('select'),
-    lastTouch: detail.locator('input[type="date"]').first(),
-    nextAction: detail.getByPlaceholder('e.g. Follow up on outreach'),
-    waitingOn: detail.getByPlaceholder('e.g. recruiter response'),
-    followUpDue: detail.locator('input[type="date"]').nth(1),
-    notes: detail.getByPlaceholder('notes'),
-    save: detail.getByRole('button', { name: 'Save Changes' }),
-    cancel: detail.getByRole('button', { name: 'Cancel' }),
-    tomorrow: detail.getByRole('button', { name: 'Tomorrow' }),
+    priority: cell.locator('.fu-priority-badge select'),
+    lastTouch: cell.locator('.fu-context-block input[type="date"]'),
+    nextAction: operating.getByPlaceholder('e.g. Follow up on outreach'),
+    waitingOn: operating.getByPlaceholder('e.g. recruiter response'),
+    followUpDue: cell.locator('.fu-action-block input[type="date"]'),
+    notes: operating.getByPlaceholder('notes'),
+    save: operating.getByRole('button', { name: 'Save Changes' }),
+    cancel: operating.getByRole('button', { name: 'Cancel' }),
+    tomorrow: operating.getByRole('button', { name: 'Tomorrow' }),
   };
 }
 
@@ -242,7 +247,7 @@ test('a bucket change that moves the row out of the active filter correctly remo
 
   await page.locator(`tr.fu-row[data-job-key="${JOB_KEY}"]`).click();
   const detail = page.locator('.fu-operating');
-  await detail.locator('input[type="date"]').nth(1).fill(TODAY); // -> bucket TODAY, out of Upcoming
+  await detail.locator('.fu-action-block input[type="date"]').fill(TODAY); // -> bucket TODAY, out of Upcoming
   await detail.getByRole('button', { name: 'Save Changes' }).click();
   await expect(page.locator('.fu-save-status')).toHaveText('Saved');
 

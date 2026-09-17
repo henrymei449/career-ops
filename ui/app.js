@@ -691,32 +691,46 @@ const HOME_TOP_FILTERS = [
   ['DUE_OVERDUE', 'Due / Overdue'],
   ['APPLIED', 'Applied'],
 ];
+// Applied-date filters (Home UI correction, section 3) — rolling trailing-day
+// windows anchored on todayStr, NOT calendar weeks: "Last 7 Days" and "Last
+// 14 Days" both include today and therefore overlap each other (and
+// "Applied Today"). These are independent filter predicates the operator
+// picks one of at a time, not a single mutually-exclusive partition, so a
+// row's membership in one doesn't determine its membership in another.
 const HOME_APPLIED_BUCKETS = [
-  ['TODAY', 'Today'],
-  ['THIS_WEEK', 'This Week'],
-  ['LAST_WEEK', 'Last Week'],
-  ['OLDER', '>2 Weeks'],
+  ['TODAY', 'Applied Today'],
+  ['LAST_7', 'Last 7 Days'],
+  ['LAST_14', 'Last 14 Days'],
+  ['OLDER', '> 2 Weeks'],
 ];
 
-/** Monday-start local calendar-week key (YYYY-MM-DD of that week's Monday) for a YYYY-MM-DD date string. */
-function weekKeyLocal(dateStr) {
-  const d = new Date(`${dateStr}T00:00:00`);
-  const dow = (d.getDay() + 6) % 7; // Mon=0 .. Sun=6
-  d.setDate(d.getDate() - dow);
-  return d.toISOString().slice(0, 10);
-}
-
-/** Which HOME_APPLIED_BUCKETS bucket an applied_at timestamp falls in, relative to todayStr (YYYY-MM-DD). */
-function appliedTimeBucket(appliedAt, todayStr) {
+/** Whole calendar days between an applied_at timestamp and todayStr (0 = today); null if unset. */
+function daysSinceApplied(appliedAt, todayStr) {
   if (!appliedAt) return null;
   const appliedDateStr = new Date(appliedAt).toISOString().slice(0, 10);
-  if (appliedDateStr === todayStr) return 'TODAY';
-  const thisWeekKey = weekKeyLocal(todayStr);
-  if (weekKeyLocal(appliedDateStr) === thisWeekKey) return 'THIS_WEEK';
-  const lastWeekAnchor = new Date(`${thisWeekKey}T00:00:00`);
-  lastWeekAnchor.setDate(lastWeekAnchor.getDate() - 7);
-  if (weekKeyLocal(appliedDateStr) === lastWeekAnchor.toISOString().slice(0, 10)) return 'LAST_WEEK';
-  return 'OLDER';
+  const days = Math.round((new Date(`${todayStr}T00:00:00`) - new Date(`${appliedDateStr}T00:00:00`)) / 86400000);
+  return days;
+}
+
+/**
+ * Does this applied_at match the given HOME_APPLIED_BUCKETS key, relative to
+ * todayStr? Boundary convention: "Last 7 Days"/"Last 14 Days" count today as
+ * day 0, so they cover days 0-6 and 0-13 respectively (7 and 14 distinct
+ * calendar days); "> 2 Weeks" is exactly their complement (day >= 14) so
+ * every dated row lands in exactly one of {OLDER} vs {LAST_14}, with no gap
+ * or double-count at the boundary. An unset applied_at never matches any of
+ * these — undated jobs don't appear in Applied-date views.
+ */
+function appliedTimeBucket(bucketKey, appliedAt, todayStr) {
+  const days = daysSinceApplied(appliedAt, todayStr);
+  if (days === null || days < 0) return false;
+  switch (bucketKey) {
+    case 'TODAY': return days === 0;
+    case 'LAST_7': return days <= 6;
+    case 'LAST_14': return days <= 13;
+    case 'OLDER': return days >= 14;
+    default: return false;
+  }
 }
 
 /** Short "Applied Nd ago" / "Waiting Nd" / "Overdue Nd" / etc. operator-facing age text — display only, derived from existing fields. */
@@ -809,7 +823,7 @@ async function loadFollowup() {
   const appliedRows = allRows.filter((r) => r.home_kind === 'APPLIED');
   const appliedBucketCounts = {};
   for (const [key] of HOME_APPLIED_BUCKETS) {
-    appliedBucketCounts[key] = appliedRows.filter((r) => appliedTimeBucket(r.applied_at, todayStr) === key).length;
+    appliedBucketCounts[key] = appliedRows.filter((r) => appliedTimeBucket(key, r.applied_at, todayStr)).length;
   }
 
   const activeFilter = state.homeFilter || 'ALL_ACTIVE';
@@ -830,7 +844,7 @@ async function loadFollowup() {
         onclick: () => { state.homeAppliedBucket = state.homeAppliedBucket === key ? null : key; loadFollowup(); },
       }, [el('span', { text: label }), el('b', { text: String(appliedBucketCounts[key]) })]));
     }
-    if (state.homeAppliedBucket) rows = rows.filter((r) => appliedTimeBucket(r.applied_at, todayStr) === state.homeAppliedBucket);
+    if (state.homeAppliedBucket) rows = rows.filter((r) => appliedTimeBucket(state.homeAppliedBucket, r.applied_at, todayStr));
   }
 
   rows = sortHomeRowsForDisplay(rows, activeFilter);
@@ -847,17 +861,37 @@ async function loadFollowup() {
   }
 
   const table = el('table', { class: 'fu-table' });
+  // Shared grid: this <colgroup> is the one width definition both the header
+  // and every collapsed row draw from (native table layout keeps them
+  // pixel-aligned) — Applied/Priority/Status/Last Touch/Follow-up stay
+  // compact, and the width freed by dropping the Age column (Home UI
+  // correction, section 1) goes mostly to Next Action, then Company / Role
+  // and Waiting On (spec section 1's original ordering).
+  const colgroup = el('colgroup', {}, [
+    el('col', { style: 'width:76px' }),   // Applied
+    el('col', { style: 'width:70px' }),   // Priority
+    el('col', { style: 'width:24%' }),    // Company / Role
+    el('col', { style: 'width:92px' }),   // Status
+    el('col', { style: 'width:96px' }),   // Last Touch
+    el('col', { style: 'width:88px' }),   // Follow-Up
+    el('col', { style: 'width:31%' }),    // Next Action
+    el('col', { style: 'width:18%' }),    // Waiting On
+  ]);
+  table.appendChild(colgroup);
   const thead = el('thead', {}, el('tr', {}, [
-    el('th', { text: 'Priority' }), el('th', { text: 'Applied' }), el('th', { text: 'Company / Role' }),
-    el('th', { text: 'Status' }), el('th', { text: 'Last Touch' }),
-    el('th', { text: 'Next Action' }), el('th', { text: 'Waiting On' }), el('th', { text: 'Follow-up' }),
-    el('th', { text: 'Age' }),
+    el('th', { text: 'Applied' }), el('th', { text: 'Priority' }), el('th', { text: 'Company / Role' }),
+    el('th', { text: 'Status' }), el('th', { text: 'Last Touch' }), el('th', { text: 'Follow-up' }),
+    el('th', { text: 'Next Action' }), el('th', { text: 'Waiting On' }),
   ]));
   table.appendChild(thead);
   const tbody = el('tbody');
-  for (const row of rows) {
-    for (const r of renderHomeRow(row, todayStr)) tbody.appendChild(r);
-  }
+  // Zebra striping is keyed by opportunity index (rows.indexOf-equivalent
+  // counter), not DOM child position — an expanded row inserts a second
+  // <tr class="fu-detail"> per opportunity, so nth-child striping would
+  // drift after the first expansion (section 6).
+  rows.forEach((row, i) => {
+    for (const r of renderHomeRow(row, todayStr, i)) tbody.appendChild(r);
+  });
   table.appendChild(tbody);
   listEl.appendChild(table);
 }
@@ -868,24 +902,27 @@ async function loadFollowup() {
 // (/api/ready/applied, /api/ready/pass) rather than inventing a second
 // mark-applied/pass code path. Same inline two-step confirm pattern as the
 // Ready to Apply tab (never window.confirm() — see loadReady()'s comment).
-function renderReadyHomeRow(row, todayStr) {
-  const tr = el('tr', { class: 'fu-row', 'data-job-key': row.job_key, onclick: () => {
-    state.followupExpanded = state.followupExpanded === row.job_key ? null : row.job_key;
-    loadFollowup();
-  } });
-  tr.appendChild(el('td', { text: '—' }));
-  tr.appendChild(el('td', { text: '—' }));
+function renderReadyHomeRow(row, todayStr, stripeIndex) {
+  const tr = el('tr', {
+    class: `fu-row${stripeIndex % 2 === 0 ? ' fu-stripe' : ''}`,
+    'data-job-key': row.job_key,
+    onclick: () => {
+      state.followupExpanded = state.followupExpanded === row.job_key ? null : row.job_key;
+      loadFollowup();
+    },
+  });
+  tr.appendChild(el('td', { text: '—' })); // Applied
+  tr.appendChild(el('td', { text: '—' })); // Priority
   tr.appendChild(el('td', { text: `${row.company || '(company unknown)'} — ${row.role || '(role unknown)'}` }));
   tr.appendChild(el('td', { text: 'READY TO APPLY' }));
-  tr.appendChild(el('td', { text: '—' }));
-  tr.appendChild(el('td', { text: '—' }));
-  tr.appendChild(el('td', { text: '—' }));
-  tr.appendChild(el('td', { text: '—' }));
-  tr.appendChild(el('td', { text: rowAgeText(row, todayStr) }));
+  tr.appendChild(el('td', { text: '—' })); // Last Touch
+  tr.appendChild(el('td', { text: '—' })); // Follow-up
+  tr.appendChild(el('td', { text: '—' })); // Next Action
+  tr.appendChild(el('td', { text: '—' })); // Waiting On
 
   const rows = [tr];
   if (state.followupExpanded === row.job_key) {
-    const detailCell = el('td', { colspan: '9' });
+    const detailCell = el('td', { colspan: '8' });
     if (row.url && /^https?:\/\//i.test(row.url)) {
       detailCell.appendChild(el('div', { class: 'row', style: 'margin-bottom:10px' }, [
         el('a', { href: row.url, target: '_blank', rel: 'noopener', class: 'action', text: 'Open Application' }),
@@ -923,35 +960,48 @@ function renderReadyHomeRow(row, todayStr) {
   return rows;
 }
 
-function renderHomeRow(row, todayStr) {
-  if (row.home_kind === 'READY_TO_APPLY') return renderReadyHomeRow(row, todayStr);
+function renderHomeRow(row, todayStr, stripeIndex) {
+  if (row.home_kind === 'READY_TO_APPLY') return renderReadyHomeRow(row, todayStr, stripeIndex);
 
-  const tr = el('tr', { class: 'fu-row', 'data-job-key': row.job_key, onclick: () => {
-    state.followupExpanded = state.followupExpanded === row.job_key ? null : row.job_key;
-    loadFollowup();
-  } });
-  tr.appendChild(el('td', { text: row.priority || '—' }));
+  const tr = el('tr', {
+    class: `fu-row${stripeIndex % 2 === 0 ? ' fu-stripe' : ''}`,
+    'data-job-key': row.job_key,
+    onclick: () => {
+      state.followupExpanded = state.followupExpanded === row.job_key ? null : row.job_key;
+      loadFollowup();
+    },
+  });
   tr.appendChild(el('td', { text: formatAppliedLabel(row) }));
+  tr.appendChild(el('td', { text: row.priority || '—' }));
   tr.appendChild(el('td', { text: `${row.company || '(company unknown)'} — ${row.role || '(role unknown)'}` }));
   tr.appendChild(el('td', { class: `fu-status-${row.status.replace(/\s+/g, '-')}`, text: row.status }));
   tr.appendChild(el('td', { text: formatShortDate(row.last_touch) }));
+  tr.appendChild(el('td', { class: `fu-due-${row.bucket}`, text: formatFollowUpLabel(row) }));
   tr.appendChild(el('td', { text: (row.next_action || '—') + (row.extra_count > 0 ? ` (+${row.extra_count})` : '') }));
   tr.appendChild(el('td', { text: row.waiting_on || '—' }));
-  tr.appendChild(el('td', { class: `fu-due-${row.bucket}`, text: formatFollowUpLabel(row) }));
-  tr.appendChild(el('td', { class: 'meta', text: rowAgeText(row, todayStr) }));
 
   const rows = [tr];
   if (state.followupExpanded === row.job_key) {
-    const detailCell = el('td', { colspan: '9' });
-    const grid = el('div', { class: 'fu-detail-grid' }, [
-      el('div', {}, [el('span', { text: 'Company / Role:' }), document.createTextNode(`${row.company || '(unknown)'} — ${row.role || '(unknown)'}`)]),
-      el('div', {}, [el('span', { text: 'Applied:' }), document.createTextNode(formatAppliedLabel(row))]),
-      el('div', { onclick: (ev) => ev.stopPropagation() }, [el('span', { text: 'Stage:' }), renderStageControl(row, detailCell)]),
-      // Status stays derived/read-only (spec section 6) — never a control here.
-      el('div', {}, [el('span', { text: 'Status:' }), document.createTextNode(row.status)]),
+    const detailCell = el('td', { colspan: '8' });
+    // Card header: identity (already the collapsed row's own text, repeated
+    // here since the detail row is visually detached from it) plus the two
+    // compact status controls — Stage (saves immediately) and Priority
+    // (part of the Operating draft, saved via Save Changes below). Company/
+    // Role has no separate label here since it's the title itself, and
+    // "Operating:" is gone — the block labels below (NEXT ACTION, etc.)
+    // already say what they are.
+    const badges = el('div', { class: 'fu-card-badges', onclick: (ev) => ev.stopPropagation() }, [
+      el('div', { class: 'fu-card-badge fu-stage-badge' }, [el('span', { text: 'Stage' }), renderStageControl(row, detailCell)]),
     ]);
-    detailCell.appendChild(grid);
-    detailCell.appendChild(renderOperatingControls(row, detailCell));
+    const head = el('div', { class: 'fu-card-head' }, [
+      el('div', { class: 'fu-card-title', text: `${row.company || '(unknown)'} — ${row.role || '(unknown)'}` }),
+      badges,
+    ]);
+    detailCell.appendChild(head);
+    // Status stays derived/read-only (spec section 6) — never a control here.
+    detailCell.appendChild(el('div', { class: 'fu-card-status' },
+      document.createTextNode(`Status: ${row.status}   ·   Applied: ${formatAppliedLabel(row)}`)));
+    detailCell.appendChild(renderOperatingControls(row, detailCell, badges));
     detailCell.appendChild(el('div', { class: 'meta', text: 'Contact-level action (per outreach contact):', style: 'margin-top:14px' }));
     detailCell.appendChild(renderActionControl(row, detailCell));
     const btnRow = el('div', { class: 'row', style: 'margin-top:10px' });
@@ -995,6 +1045,7 @@ function renderHomeRow(row, todayStr) {
 // correctly and is never silently overwritten by re-selecting it.
 function renderStageControl(row, detailCell) {
   const select = el('select', {
+    class: 'fu-field-select',
     onchange: async (ev) => {
       const value = ev.target.value;
       if (value === row.application_stage) return;
@@ -1064,27 +1115,27 @@ function diffOperatingPatch(persisted, draft) {
 // while editing; it's only reset (correctly) by the loadFollowup() call
 // Save Changes itself triggers on success, since that's a fresh render off
 // the just-saved server state.
-function renderOperatingControls(row, detailCell) {
+function renderOperatingControls(row, detailCell, badgesContainer) {
   const persisted = freshOperatingDraft(row.operating);
   const draft = { ...persisted };
 
-  const prioritySelect = el('select', {});
+  const prioritySelect = el('select', { class: 'fu-field-select' });
   for (const p of PRIORITY_OPTIONS) prioritySelect.appendChild(el('option', { value: p, text: p }));
   prioritySelect.value = draft.priority || '—';
 
-  const lastTouchInput = el('input', { type: 'date' });
+  const lastTouchInput = el('input', { type: 'date', class: 'fu-field' });
   if (draft.last_touch) lastTouchInput.value = draft.last_touch;
 
-  const nextActionInput = el('input', { type: 'text', placeholder: 'e.g. Follow up on outreach' });
+  const nextActionInput = el('input', { type: 'text', class: 'fu-field', placeholder: 'e.g. Follow up on outreach' });
   nextActionInput.value = draft.next_action || '';
 
-  const waitingOnInput = el('input', { type: 'text', placeholder: 'e.g. recruiter response' });
+  const waitingOnInput = el('input', { type: 'text', class: 'fu-field', placeholder: 'e.g. recruiter response' });
   waitingOnInput.value = draft.waiting_on || '';
 
-  const followUpInput = el('input', { type: 'date' });
+  const followUpInput = el('input', { type: 'date', class: 'fu-field' });
   if (draft.follow_up_due) followUpInput.value = draft.follow_up_due;
 
-  const notesInput = el('input', { type: 'text', placeholder: 'notes' });
+  const notesInput = el('input', { type: 'text', class: 'fu-field', placeholder: 'notes' });
   notesInput.value = draft.notes || '';
 
   const unsavedEl = el('span', { class: 'meta fu-unsaved', text: 'Unsaved changes', style: 'display:none;color:#8a6300;margin-left:8px' });
@@ -1164,27 +1215,50 @@ function renderOperatingControls(row, detailCell) {
     }
   });
 
+  // Priority is part of this draft (saved via Save Changes below, not
+  // immediately like Stage), but visually it belongs next to Stage in the
+  // card header badges, not buried in the action block.
+  if (badgesContainer) {
+    badgesContainer.appendChild(el('div', { class: 'fu-card-badge fu-priority-badge' }, [el('span', { text: 'Priority' }), prioritySelect]));
+  }
+
   const wrap = el('div', { class: 'fu-operating', onclick: (ev) => ev.stopPropagation(), style: 'margin:10px 0' });
-  wrap.appendChild(el('div', { class: 'meta', text: 'Operating:', style: 'margin-bottom:6px' }));
-  const grid = el('div', { class: 'fu-detail-grid' }, [
-    el('div', {}, [el('span', { text: 'Priority:' }), prioritySelect]),
-    el('div', {}, [el('span', { text: 'Last Touch:' }), lastTouchInput]),
-    el('div', {}, [el('span', { text: 'Next Action:' }), nextActionInput]),
-    el('div', {}, [el('span', { text: 'Waiting On:' }), waitingOnInput]),
-    el('div', {}, [el('span', { text: 'Notes:' }), notesInput]),
-  ]);
-  wrap.appendChild(grid);
-  const followUpRow = el('div', { class: 'row', style: 'margin-top:8px;gap:8px;align-items:center' }, [
-    el('span', { class: 'meta', text: 'Follow-Up Due:' }), followUpInput,
-  ]);
-  wrap.appendChild(followUpRow);
-  const quickRow = el('div', { class: 'row', style: 'margin-top:6px;gap:6px' }, [
+
+  // Primary operating block: Next Action / Follow-Up Due / Waiting On —
+  // the three fields an operator actually works from day to day (spec
+  // section 2).
+  const actionBlock = el('div', { class: 'fu-action-block' });
+  actionBlock.appendChild(el('div', { class: 'fu-field-group' }, [
+    el('div', { class: 'fu-block-label', text: 'Next Action' }), nextActionInput,
+  ]));
+  const quickRow = el('div', { class: 'fu-followup-row' }, [
+    followUpInput,
     quickBtn('Tomorrow', 1),
     quickBtn('+3 days', 3),
     quickBtn('+7 days', 7),
     el('button', { class: 'action', text: 'Clear', onclick: (ev) => { ev.stopPropagation(); setFollowUpDraft(null); } }),
   ]);
-  wrap.appendChild(quickRow);
+  actionBlock.appendChild(el('div', { class: 'fu-field-group' }, [
+    el('div', { class: 'fu-block-label', text: 'Follow-Up Due' }), quickRow,
+  ]));
+  actionBlock.appendChild(el('div', { class: 'fu-field-group' }, [
+    el('div', { class: 'fu-block-label', text: 'Waiting On' }), waitingOnInput,
+  ]));
+  wrap.appendChild(actionBlock);
+
+  wrap.appendChild(el('div', { class: 'fu-card-divider' }));
+
+  // Secondary context/history block: Last Touch / Notes — no longer left
+  // floating on its own (spec section 3).
+  const contextBlock = el('div', { class: 'fu-context-block' });
+  contextBlock.appendChild(el('div', { class: 'fu-field-group' }, [
+    el('div', { class: 'fu-block-label', text: 'Last Touch' }), lastTouchInput,
+  ]));
+  contextBlock.appendChild(el('div', { class: 'fu-field-group' }, [
+    el('div', { class: 'fu-block-label', text: 'Notes' }), notesInput,
+  ]));
+  wrap.appendChild(contextBlock);
+
   const saveRow = el('div', { class: 'row', style: 'margin-top:10px;gap:8px;align-items:center' }, [
     saveBtn, cancelBtn, unsavedEl, statusEl,
   ]);
