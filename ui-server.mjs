@@ -49,7 +49,7 @@ import {
 } from './outreach.mjs';
 import { intakeJob } from './adhoc-intake.mjs';
 import { APPLICATION_ALIVE_STATUSES, APPLICATION_CLOSED_STATUSES } from './application-schema.mjs';
-import { deriveOutreachCompletion } from './followup-schema.mjs';
+import { deriveOutreachCompletion, buildHomeRows } from './followup-schema.mjs';
 
 const DATA_ROOT = getCareerOpsRoot();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -352,8 +352,15 @@ const API_ROUTES = [
   }],
   // Follow-up (Pass 4): derived queue over outreach.selected_contacts — no
   // second source of truth. See followup-schema.mjs for the bucket rule and
-  // outreach.mjs for the read/mutation layer.
-  ['GET', '/api/followup', async () => ({ actions: listFollowUpActions() })],
+  // outreach.mjs for the read/mutation layer. `home_rows` (Pass 5 job-level
+  // patch) is the same `actions` list re-grouped one row per job_key —
+  // Home's required unit of work — via followup-schema.mjs's buildHomeRows;
+  // `actions` itself is kept as-is so Mark Done/Skip keep resolving against
+  // real per-contact action_ids.
+  ['GET', '/api/followup', async () => {
+    const actions = listFollowUpActions();
+    return { actions, home_rows: buildHomeRows(actions) };
+  }],
   ['POST', '/api/followup/complete', async (body) => {
     const { action_id: actionId } = body;
     if (!actionId) throw new Error('action_id required');

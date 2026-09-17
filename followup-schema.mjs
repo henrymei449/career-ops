@@ -139,6 +139,7 @@ export function buildFollowUpAction({ jobKey, job, contact, todayStr }) {
     contact_status: withDefaults.status,
     application_status: job.application_status || 'ACTIVE',
     application_stage: job.application_stage || 'Applied',
+    applied_at: job.applied_at || null,
   };
 }
 
@@ -191,6 +192,7 @@ export function buildApplicationPendingAction({ jobKey, job }) {
     contact_status: null,
     application_status: applicationStatus,
     application_stage: job.application_stage || 'Applied',
+    applied_at: job.applied_at || null,
   };
 }
 
@@ -238,4 +240,108 @@ export function deriveOutreachCompletion(outreach) {
   if (hasPending) return 'IN_PROGRESS';
   const allExecuted = contacts.every((c) => EXECUTED_CONTACT_STATUSES.includes(c.status));
   return allExecuted ? 'COMPLETE' : 'IN_PROGRESS';
+}
+
+// ── Home job-level rows (presentation/aggregation patch) ────────────────
+//
+// listFollowUpActions() is deliberately granular: one row per (job, contact)
+// action, plus at most one synthetic APPLICATION_PENDING fallback for a job
+// with none. That is the correct source of truth for outreach work, but it
+// is the wrong unit for Home, whose contract is "one row per applied job."
+// The functions below are a pure read-time re-grouping of that same list —
+// no new durable state, no change to what listFollowUpActions returns.
+
+export const HOME_STATUSES = ['ACTION DUE', 'WAITING', 'STALE'];
+
+/**
+ * Priority for picking the single action a job-level Home row represents:
+ * OVERDUE -> TODAY -> nearest UPCOMING -> an undated real (contact-backed)
+ * WAITING action -> the synthetic no-action/WAITING fallback. A job's
+ * fallback row and its real rows never coexist (listFollowUpActions only
+ * emits the fallback when the job has zero real actionable rows), so the
+ * real-vs-fallback tiebreak below is a documentation of intent more than a
+ * case that occurs in practice.
+ */
+function homeActionRank(action) {
+  const bucketRank = BUCKET_ORDER[action.bucket] ?? BUCKET_ORDER.WAITING;
+  const isFallback = action.contact_id == null ? 1 : 0;
+  return [bucketRank, isFallback];
+}
+
+/** Pick the one action a job's actions collapse to on Home. `jobActions` must be non-empty. */
+export function selectHomeAction(jobActions) {
+  return [...jobActions].sort((a, b) => {
+    const [aBucket, aFallback] = homeActionRank(a);
+    const [bBucket, bFallback] = homeActionRank(b);
+    if (aBucket !== bBucket) return aBucket - bBucket;
+    if (aFallback !== bFallback) return aFallback - bFallback;
+    const dueCmp = String(a.due_at || '').localeCompare(String(b.due_at || ''));
+    return dueCmp !== 0 ? dueCmp : a.action_id.localeCompare(b.action_id);
+  })[0];
+}
+
+/**
+ * Operator-facing status for a Home row. STALE reflects the job's own
+ * durable application_status (set by historical-sheet migration or a future
+ * staleness check — never invented here); otherwise ACTION DUE means the
+ * selected action is due now (OVERDUE/TODAY), and everything else (an
+ * undated action, a future UPCOMING date, or no action at all) is WAITING.
+ */
+export function deriveHomeStatus(action) {
+  if (action.application_status === 'STALE') return 'STALE';
+  if (action.bucket === 'OVERDUE' || action.bucket === 'TODAY') return 'ACTION DUE';
+  return 'WAITING';
+}
+
+/**
+ * Group listFollowUpActions()'s granular actions into one row per job_key —
+ * Home's required unit of work. Each row carries the full set of that job's
+ * actions (`actions`) for row-detail rendering (Mark Done/Skip stay
+ * per-contact, resolved against their own action_id, unchanged), plus
+ * `extra_count` = how many additional actionable rows that job has beyond
+ * the one selected to represent it, so the UI can show "(+N)" without
+ * hiding that work exists.
+ *
+ * NEXT ACTION / FOLLOW-UP are surfaced as `next_action` / `due_at` on the
+ * row and are null for a fallback (APPLICATION_PENDING) job — that label is
+ * a display artifact of listFollowUpActions, never something Home renders.
+ */
+export function buildHomeRows(actions) {
+  const byJob = new Map();
+  for (const action of actions) {
+    if (!byJob.has(action.job_key)) byJob.set(action.job_key, []);
+    byJob.get(action.job_key).push(action);
+  }
+  const rows = [];
+  for (const [jobKey, jobActions] of byJob) {
+    const primary = selectHomeAction(jobActions);
+    const isFallback = primary.contact_id == null;
+    rows.push({
+      job_key: jobKey,
+      company: primary.company,
+      role: primary.role,
+      applied_at: primary.applied_at,
+      application_stage: primary.application_stage,
+      application_status: primary.application_status,
+      status: deriveHomeStatus(primary),
+      next_action: isFallback ? null : primary.action,
+      due_at: isFallback ? null : primary.due_at,
+      bucket: primary.bucket,
+      action_id: primary.action_id,
+      contact_id: primary.contact_id,
+      extra_count: jobActions.length - 1,
+      actions: sortFollowUpActions(jobActions),
+    });
+  }
+  return sortHomeRows(rows);
+}
+
+/** Stable Home order: same severity-first rule as sortFollowUpActions, applied to the one row per job. */
+export function sortHomeRows(rows) {
+  return [...rows].sort((a, b) => {
+    const cmp = BUCKET_ORDER[a.bucket] - BUCKET_ORDER[b.bucket];
+    if (cmp !== 0) return cmp;
+    const dueCmp = String(a.due_at || '').localeCompare(String(b.due_at || ''));
+    return dueCmp !== 0 ? dueCmp : a.job_key.localeCompare(b.job_key);
+  });
 }
