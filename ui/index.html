@@ -43,12 +43,17 @@
   .candidate label { flex: 1; cursor: pointer; }
   .badge { display: inline-block; font-size: 11px; padding: 2px 6px; border-radius: 10px; background: #eef1f4; color: #444; margin-left: 6px; }
   a { color: #1c5fb4; }
-  .fu-chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #ddd; border-radius: 6px; padding: 6px 12px; font-size: 13px; background: #fff; }
+  .fu-chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #ddd; border-radius: 6px; padding: 6px 12px; font-size: 13px; background: #fff; font-family: inherit; cursor: pointer; }
+  .fu-chip:hover { background: #f0f1f3; }
+  .fu-chip.selected { border-color: #1c2b3a; box-shadow: inset 0 0 0 1px #1c2b3a; }
   .fu-chip b { font-size: 15px; }
   .fu-chip.overdue b { color: #a01c1c; }
   .fu-chip.today b { color: #8a6300; }
   .fu-chip.upcoming b { color: #1c5fb4; }
   .fu-chip.waiting b { color: #555; }
+  .fu-operating input[type="text"], .fu-operating input[type="date"] { padding: 4px 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; width: 100%; }
+  .fu-operating select { padding: 4px 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+  .fu-operating .fu-detail-grid { grid-template-columns: repeat(2, minmax(200px, 1fr)); }
   table.fu-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e1e4e8; border-radius: 6px; overflow: hidden; font-size: 13px; }
   table.fu-table th { text-align: left; padding: 8px 10px; background: #f5f6f8; border-bottom: 1px solid #e1e4e8; font-size: 11px; text-transform: uppercase; color: #666; }
   table.fu-table td { padding: 8px 10px; border-bottom: 1px solid #f0f0f0; }

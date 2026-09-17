@@ -29,6 +29,7 @@
 //     row kinds (real per-contact actions vs. this fallback) are combined.
 
 import { APPLICATION_CLOSED_STATUSES } from './application-schema.mjs';
+import { localToday } from './lib/local-today.mjs';
 
 export const CONTACT_STATUSES = ['CONTACT_SELECTED', 'OUTREACH_SENT', 'REPLIED', 'COMPLETE', 'SKIPPED'];
 export const NEXT_ACTIONS = ['SEND_EMAIL', 'SEND_MESSAGE', 'CHECK_CONNECTION', 'FOLLOW_UP'];
@@ -140,6 +141,7 @@ export function buildFollowUpAction({ jobKey, job, contact, todayStr }) {
     application_status: job.application_status || 'ACTIVE',
     application_stage: job.application_stage || 'Applied',
     applied_at: job.applied_at || null,
+    operating: withOperatingDefaults(job.operating),
   };
 }
 
@@ -193,6 +195,7 @@ export function buildApplicationPendingAction({ jobKey, job }) {
     application_status: applicationStatus,
     application_stage: job.application_stage || 'Applied',
     applied_at: job.applied_at || null,
+    operating: withOperatingDefaults(job.operating),
   };
 }
 
@@ -242,6 +245,50 @@ export function deriveOutreachCompletion(outreach) {
   return allExecuted ? 'COMPLETE' : 'IN_PROGRESS';
 }
 
+// ── Job-level operating metadata (Home operating-board MVP) ──────────────
+//
+// The Action Board spreadsheet's operating loop (Last Touch -> Next Action
+// -> Waiting On -> Follow-Up Due -> Notes) belongs to the APPLIED job itself,
+// not to any one contact — a job with zero contacts still needs an operator
+// action. `operating` is a small durable object stored directly on the job
+// record (job.operating), read/written by outreach.mjs's
+// updateJobOperatingMetadata; everything here is pure validation/defaulting,
+// mirroring withContactActionDefaults' backfill-without-overwrite shape.
+
+export const OPERATING_PRIORITIES = ['P0', 'P1', 'P2', 'P3', '—'];
+export const OPERATING_TEXT_FIELDS = ['next_action', 'waiting_on', 'notes'];
+export const OPERATING_DATE_FIELDS = ['last_touch', 'follow_up_due'];
+export const OPERATING_FIELDS = ['priority', 'last_touch', 'next_action', 'waiting_on', 'follow_up_due', 'notes'];
+export const MAX_OPERATING_TEXT_LEN = 500;
+
+/** @param {string} p @returns {boolean} */
+export function isValidPriority(p) {
+  return OPERATING_PRIORITIES.includes(p);
+}
+
+/** @param {string} s @returns {boolean} true for a real, parseable YYYY-MM-DD date */
+export function isValidDateStr(s) {
+  return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(new Date(`${s}T00:00:00`).getTime());
+}
+
+/** Fresh job-level operating fields for a job that has never had any set. */
+export function freshOperating() {
+  return { priority: null, last_touch: null, next_action: null, waiting_on: null, follow_up_due: null, notes: null };
+}
+
+/** Backfill missing operating fields without overwriting any already present — same pattern as withContactActionDefaults. */
+export function withOperatingDefaults(operating) {
+  return { ...freshOperating(), ...(operating || {}) };
+}
+
+/** OVERDUE/TODAY/UPCOMING for a raw due date against today, or null if there is no date. */
+export function deriveDueBucket(dueDate, todayStr) {
+  if (!dueDate) return null;
+  if (dueDate < todayStr) return 'OVERDUE';
+  if (dueDate === todayStr) return 'TODAY';
+  return 'UPCOMING';
+}
+
 // ── Home job-level rows (presentation/aggregation patch) ────────────────
 //
 // listFollowUpActions() is deliberately granular: one row per (job, contact)
@@ -284,12 +331,18 @@ export function selectHomeAction(jobActions) {
  * Operator-facing status for a Home row. STALE reflects the job's own
  * durable application_status (set by historical-sheet migration or a future
  * staleness check — never invented here); otherwise ACTION DUE means the
- * selected action is due now (OVERDUE/TODAY), and everything else (an
- * undated action, a future UPCOMING date, or no action at all) is WAITING.
+ * EFFECTIVE due date (job-level operating.follow_up_due when set, else the
+ * selected contact action's own due date — see buildHomeRows) is due now
+ * (OVERDUE/TODAY), and everything else (an undated action, a future
+ * UPCOMING date, or no action at all) is WAITING.
+ *
+ * @param {{application_status: string, bucket: string}} row - a value
+ *   already carrying the EFFECTIVE bucket (buildHomeRows computes this
+ *   before calling in), not necessarily the raw contact-action bucket.
  */
-export function deriveHomeStatus(action) {
-  if (action.application_status === 'STALE') return 'STALE';
-  if (action.bucket === 'OVERDUE' || action.bucket === 'TODAY') return 'ACTION DUE';
+export function deriveHomeStatus(row) {
+  if (row.application_status === 'STALE') return 'STALE';
+  if (row.bucket === 'OVERDUE' || row.bucket === 'TODAY') return 'ACTION DUE';
   return 'WAITING';
 }
 
@@ -302,11 +355,21 @@ export function deriveHomeStatus(action) {
  * the one selected to represent it, so the UI can show "(+N)" without
  * hiding that work exists.
  *
- * NEXT ACTION / FOLLOW-UP are surfaced as `next_action` / `due_at` on the
- * row and are null for a fallback (APPLICATION_PENDING) job — that label is
- * a display artifact of listFollowUpActions, never something Home renders.
+ * Display precedence (Home operating-metadata MVP): NEXT ACTION and
+ * FOLLOW-UP are job-level operating fields FIRST, falling back to the
+ * selected contact action's own action/due date when no job-level value is
+ * set, and to null for a fallback (APPLICATION_PENDING) job with neither.
+ * This is what lets a job with zero contacts still be managed from Home.
+ * `bucket`/`status` are derived from that EFFECTIVE due date, not the raw
+ * contact bucket, so setting a job-level Follow-Up Due recomputes severity
+ * immediately (a job-level date has no precomputed bucket of its own — see
+ * deriveDueBucket — while a contact-sourced date keeps the bucket
+ * deriveBucket already computed against the same `todayStr`).
+ *
+ * @param {object[]} actions
+ * @param {string} [todayStr] - YYYY-MM-DD; defaults to the local calendar day.
  */
-export function buildHomeRows(actions) {
+export function buildHomeRows(actions, todayStr = localToday()) {
   const byJob = new Map();
   for (const action of actions) {
     if (!byJob.has(action.job_key)) byJob.set(action.job_key, []);
@@ -316,22 +379,49 @@ export function buildHomeRows(actions) {
   for (const [jobKey, jobActions] of byJob) {
     const primary = selectHomeAction(jobActions);
     const isFallback = primary.contact_id == null;
-    rows.push({
+    const operating = withOperatingDefaults(primary.operating);
+
+    const nextAction = operating.next_action || (isFallback ? null : primary.action);
+    let dueAt;
+    let bucket;
+    if (operating.follow_up_due) {
+      dueAt = operating.follow_up_due;
+      bucket = deriveDueBucket(dueAt, todayStr) || 'WAITING';
+    } else {
+      dueAt = isFallback ? null : primary.due_at;
+      bucket = primary.bucket;
+    }
+
+    const row = {
       job_key: jobKey,
       company: primary.company,
       role: primary.role,
       applied_at: primary.applied_at,
       application_stage: primary.application_stage,
       application_status: primary.application_status,
-      status: deriveHomeStatus(primary),
-      next_action: isFallback ? null : primary.action,
-      due_at: isFallback ? null : primary.due_at,
-      bucket: primary.bucket,
+      priority: operating.priority || null,
+      last_touch: operating.last_touch || null,
+      waiting_on: operating.waiting_on || null,
+      notes: operating.notes || null,
+      // Raw job-level operating fields (unmerged) — for an editor to prefill
+      // FROM, so a contact-derived fallback value never gets echoed back as
+      // if it were a saved operating field. `next_action`/`due_at` below are
+      // the DISPLAY/status values (job-level override, else contact
+      // fallback); `contact_next_action`/`contact_due_at` are the raw
+      // per-contact values alone, for the contact-level editor to prefill.
+      operating,
+      next_action: nextAction,
+      due_at: dueAt,
+      bucket,
+      contact_next_action: isFallback ? null : primary.action,
+      contact_due_at: isFallback ? null : primary.due_at,
       action_id: primary.action_id,
       contact_id: primary.contact_id,
       extra_count: jobActions.length - 1,
       actions: sortFollowUpActions(jobActions),
-    });
+    };
+    row.status = deriveHomeStatus(row);
+    rows.push(row);
   }
   return sortHomeRows(rows);
 }

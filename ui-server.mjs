@@ -48,6 +48,7 @@ import {
   updateApplicationStatus,
   updateFollowUpAction,
   updateApplicationStage,
+  updateJobOperatingMetadata,
 } from './outreach.mjs';
 import { intakeJob } from './adhoc-intake.mjs';
 import { APPLICATION_ALIVE_STATUSES, APPLICATION_CLOSED_STATUSES } from './application-schema.mjs';
@@ -395,6 +396,16 @@ const API_ROUTES = [
     if (!jobKey) throw new Error('job_key required');
     if (!stage) throw new Error('stage required');
     return updateApplicationStage(jobKey, stage, { root: DATA_ROOT });
+  }],
+  // Home operating-metadata MVP: job-level Priority/Last Touch/Next Action/
+  // Waiting On/Follow-Up Due/Notes — see updateJobOperatingMetadata's own
+  // doc comment (outreach.mjs) for the patch semantics. Every key besides
+  // job_key is forwarded as-is; unknown-field/invalid-value rejection lives
+  // there, not in this thin route.
+  ['POST', '/api/home/operating/update', async (body) => {
+    const { job_key: jobKey, ...patch } = body;
+    if (!jobKey) throw new Error('job_key required');
+    return updateJobOperatingMetadata(jobKey, patch, { root: DATA_ROOT });
   }],
   // Ad-hoc job intake (#pass3): paste-a-URL entry point into the SAME
   // review-batch pipeline every sourced job goes through. All capture/

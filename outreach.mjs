@@ -94,6 +94,13 @@ import {
   sortFollowUpActions,
   actionId as followUpActionId,
   NEXT_ACTIONS,
+  OPERATING_FIELDS,
+  OPERATING_TEXT_FIELDS,
+  OPERATING_DATE_FIELDS,
+  MAX_OPERATING_TEXT_LEN,
+  isValidPriority,
+  isValidDateStr,
+  withOperatingDefaults,
 } from './followup-schema.mjs';
 import { mapUiApplicationStatus, HIRING_STAGES, isKnownHiringStage } from './application-schema.mjs';
 
@@ -606,6 +613,58 @@ export async function updateApplicationStage(jobKey, stage, { root = DATA_ROOT }
     }
     job.application_stage = stage;
     return { job_key: jobKey, application_stage: job.application_stage };
+  }, { root });
+}
+
+/**
+ * Home operating-metadata MVP: patch a job's Priority/Last Touch/Next
+ * Action/Waiting On/Follow-Up Due/Notes — the same operating loop the user's
+ * Action Board spreadsheet ran, moved onto the applied job itself so it
+ * works even when the job has no contact yet (see followup-schema.mjs's
+ * buildHomeRows for how these fields override the contact-derived display).
+ *
+ * `patch` is a genuine PATCH: only keys present are written, so a caller
+ * editing just `notes` cannot accidentally clear `priority`. To explicitly
+ * clear a field, pass it as `null` (or `''`, normalized to `null`) —
+ * omitting the key entirely leaves it untouched. Repeating the same patch is
+ * a safe no-op (idempotent), and every field not named in OPERATING_FIELDS
+ * (fit_decision, execution_status, outreach, ...) is left byte-for-byte
+ * alone because `mutate` only ever assigns `job.operating`.
+ *
+ * @param {string} jobKey
+ * @param {{priority?: string|null, last_touch?: string|null, next_action?: string|null, waiting_on?: string|null, follow_up_due?: string|null, notes?: string|null}} patch
+ */
+export async function updateJobOperatingMetadata(jobKey, patch, { root = DATA_ROOT } = {}) {
+  const p = patch || {};
+  for (const key of Object.keys(p)) {
+    if (!OPERATING_FIELDS.includes(key)) {
+      throw new Error(`outreach: updateJobOperatingMetadata unknown field "${key}" — must be one of ${OPERATING_FIELDS.join(', ')}`);
+    }
+  }
+  if ('priority' in p && p.priority != null && p.priority !== '' && !isValidPriority(p.priority)) {
+    throw new Error(`outreach: updateJobOperatingMetadata invalid priority "${p.priority}" — must be one of P0, P1, P2, P3, —, or null`);
+  }
+  for (const field of OPERATING_DATE_FIELDS) {
+    if (field in p && p[field] != null && p[field] !== '' && !isValidDateStr(p[field])) {
+      throw new Error(`outreach: updateJobOperatingMetadata ${field} "${p[field]}" is not a valid YYYY-MM-DD date`);
+    }
+  }
+  for (const field of OPERATING_TEXT_FIELDS) {
+    if (field in p && p[field] != null && String(p[field]).length > MAX_OPERATING_TEXT_LEN) {
+      throw new Error(`outreach: updateJobOperatingMetadata ${field} exceeds ${MAX_OPERATING_TEXT_LEN} characters`);
+    }
+  }
+  return withJobState(jobKey, (job) => {
+    if (job.execution_status !== 'APPLIED') {
+      throw new Error(`outreach: ${jobKey} has execution_status=${job.execution_status}, not APPLIED — cannot update operating metadata`);
+    }
+    const current = withOperatingDefaults(job.operating);
+    const next = { ...current };
+    for (const field of OPERATING_FIELDS) {
+      if (field in p) next[field] = p[field] === '' ? null : p[field];
+    }
+    job.operating = next;
+    return { job_key: jobKey, operating: { ...job.operating } };
   }, { root });
 }
 

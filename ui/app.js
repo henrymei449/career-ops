@@ -11,6 +11,7 @@ const state = {
   selectedBatchId: null, // Review tab's currently selected open batch
   applicationsFilter: 'alive', // Applications tab's currently selected filter
   followupExpanded: null, // job_key of the currently expanded Home row, or null
+  homeFilter: null, // one of HOME_FILTER_BUCKETS, or null for "All"
   applicationsHighlightKey: null, // job_key to scroll to/highlight after Open Application
   outreachHighlightKey: null, // job_key to scroll to/highlight after Open Outreach
 };
@@ -606,6 +607,14 @@ function formatFollowUpLabel(row) {
   return due.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
+// Generic YYYY-MM-DD -> short label formatter, for Last Touch (no bucket/
+// "Today" special-casing the way Follow-up gets — Last Touch is a plain
+// historical date, never a due-soon signal).
+function formatShortDate(dateStr) {
+  if (!dateStr) return '—';
+  return new Date(`${dateStr}T00:00:00`).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
 // Same local-date arithmetic as todayLocalStr() (n=0), generalized for the
 // Tomorrow/+3 days/+7 days quick actions below — client-side date math only,
 // the server still validates the resulting YYYY-MM-DD string on save.
@@ -623,6 +632,9 @@ function addDaysLocalStr(days) {
 // hand if either list changes.
 const NEXT_ACTION_OPTIONS = ['—', 'FOLLOW_UP', 'CHECK_CONNECTION', 'SEND_EMAIL', 'SEND_MESSAGE'];
 const HIRING_STAGE_OPTIONS = ['Applied', 'Recruiter Screen', 'Hiring Manager', 'Interview', 'Final', 'Offer'];
+// Same closed vocab as followup-schema.mjs's OPERATING_PRIORITIES.
+const PRIORITY_OPTIONS = ['—', 'P0', 'P1', 'P2', 'P3'];
+const HOME_FILTER_BUCKETS = ['TODAY', 'OVERDUE', 'UPCOMING', 'WAITING'];
 
 async function loadFollowup() {
   const countsEl = $('#followup-counts');
@@ -633,27 +645,45 @@ async function loadFollowup() {
   try { data = await api('GET', '/api/followup'); }
   catch (e) { listEl.innerHTML = ''; showError(listEl, e.message); return; }
 
-  const rows = data.home_rows || [];
+  const allRows = data.home_rows || [];
   const counts = { OVERDUE: 0, TODAY: 0, UPCOMING: 0, WAITING: 0 };
-  for (const r of rows) counts[r.bucket] = (counts[r.bucket] || 0) + 1;
-  for (const [bucket, label] of [['TODAY', 'Today'], ['OVERDUE', 'Overdue'], ['UPCOMING', 'Upcoming'], ['WAITING', 'Waiting']]) {
-    countsEl.appendChild(el('div', { class: `fu-chip ${bucket.toLowerCase()}` }, [
-      el('span', { text: label }),
-      el('b', { text: String(counts[bucket]) }),
-    ]));
+  for (const r of allRows) counts[r.bucket] = (counts[r.bucket] || 0) + 1;
+
+  // Trivial bucket filters (spec section 8) — chips are counts AND filter
+  // toggles over the same allRows the counts are computed from, so the
+  // numbers shown never drift from what "All" would list. Clicking the
+  // already-selected chip clears back to All, same toggle-off pattern the
+  // Applications tab does not use but Home's own single-select warrants
+  // since there is no separate "All" button state to fall back to otherwise.
+  const chipDefs = [['TODAY', 'Today'], ['OVERDUE', 'Overdue'], ['UPCOMING', 'Upcoming'], ['WAITING', 'Waiting']];
+  countsEl.appendChild(el('button', {
+    class: `fu-chip all${state.homeFilter === null ? ' selected' : ''}`,
+    onclick: () => { state.homeFilter = null; loadFollowup(); },
+  }, [el('span', { text: 'All' }), el('b', { text: String(allRows.length) })]));
+  for (const [bucket, label] of chipDefs) {
+    countsEl.appendChild(el('button', {
+      class: `fu-chip ${bucket.toLowerCase()}${state.homeFilter === bucket ? ' selected' : ''}`,
+      onclick: () => { state.homeFilter = state.homeFilter === bucket ? null : bucket; loadFollowup(); },
+    }, [el('span', { text: label }), el('b', { text: String(counts[bucket]) })]));
   }
 
+  const rows = state.homeFilter ? allRows.filter((r) => r.bucket === state.homeFilter) : allRows;
+
   listEl.innerHTML = '';
-  if (rows.length === 0) {
+  if (allRows.length === 0) {
     listEl.appendChild(el('p', { class: 'empty', text: 'Nothing needs action right now.' }));
+    return;
+  }
+  if (rows.length === 0) {
+    listEl.appendChild(el('p', { class: 'empty', text: 'No rows match this filter.' }));
     return;
   }
 
   const table = el('table', { class: 'fu-table' });
   const thead = el('thead', {}, el('tr', {}, [
-    el('th', { text: 'Applied' }), el('th', { text: 'Company' }), el('th', { text: 'Role' }),
-    el('th', { text: 'Stage' }), el('th', { text: 'Status' }),
-    el('th', { text: 'Next Action' }), el('th', { text: 'Follow-up' }),
+    el('th', { text: 'Priority' }), el('th', { text: 'Applied' }), el('th', { text: 'Company / Role' }),
+    el('th', { text: 'Status' }), el('th', { text: 'Last Touch' }),
+    el('th', { text: 'Next Action' }), el('th', { text: 'Waiting On' }), el('th', { text: 'Follow-up' }),
   ]));
   table.appendChild(thead);
   const tbody = el('tbody');
@@ -669,17 +699,18 @@ function renderHomeRow(row) {
     state.followupExpanded = state.followupExpanded === row.job_key ? null : row.job_key;
     loadFollowup();
   } });
+  tr.appendChild(el('td', { text: row.priority || '—' }));
   tr.appendChild(el('td', { text: formatAppliedLabel(row) }));
-  tr.appendChild(el('td', { text: row.company || '(company unknown)' }));
-  tr.appendChild(el('td', { text: row.role || '(role unknown)' }));
-  tr.appendChild(el('td', { text: row.application_stage || '(unknown)' }));
+  tr.appendChild(el('td', { text: `${row.company || '(company unknown)'} — ${row.role || '(role unknown)'}` }));
   tr.appendChild(el('td', { class: `fu-status-${row.status.replace(/\s+/g, '-')}`, text: row.status }));
+  tr.appendChild(el('td', { text: formatShortDate(row.last_touch) }));
   tr.appendChild(el('td', { text: (row.next_action || '—') + (row.extra_count > 0 ? ` (+${row.extra_count})` : '') }));
+  tr.appendChild(el('td', { text: row.waiting_on || '—' }));
   tr.appendChild(el('td', { class: `fu-due-${row.bucket}`, text: formatFollowUpLabel(row) }));
 
   const rows = [tr];
   if (state.followupExpanded === row.job_key) {
-    const detailCell = el('td', { colspan: '7' });
+    const detailCell = el('td', { colspan: '8' });
     const grid = el('div', { class: 'fu-detail-grid' }, [
       el('div', {}, [el('span', { text: 'Company / Role:' }), document.createTextNode(`${row.company || '(unknown)'} — ${row.role || '(unknown)'}`)]),
       el('div', {}, [el('span', { text: 'Applied:' }), document.createTextNode(formatAppliedLabel(row))]),
@@ -688,6 +719,8 @@ function renderHomeRow(row) {
       el('div', {}, [el('span', { text: 'Status:' }), document.createTextNode(row.status)]),
     ]);
     detailCell.appendChild(grid);
+    detailCell.appendChild(renderOperatingControls(row, detailCell));
+    detailCell.appendChild(el('div', { class: 'meta', text: 'Contact-level action (per outreach contact):', style: 'margin-top:14px' }));
     detailCell.appendChild(renderActionControl(row, detailCell));
     const btnRow = el('div', { class: 'row', style: 'margin-top:10px' });
     btnRow.appendChild(el('button', {
@@ -747,6 +780,77 @@ function renderStageControl(row, detailCell) {
   return select;
 }
 
+// Home operating-metadata MVP: Priority/Last Touch/Next Action/Waiting On/
+// Follow-Up Due/Notes, all POST /api/home/operating/update — the job-level
+// operator loop that works even on a row with zero contacts (row.contact_id
+// == null), unlike renderActionControl above. Prefills FROM row.operating
+// (the raw, unmerged job-level fields), never from the merged display
+// values (row.next_action/row.due_at), so a contact-derived fallback shown
+// in the top-level table is never echoed back into this editor as if it had
+// been explicitly set.
+function renderOperatingControls(row, detailCell) {
+  const op = row.operating || {};
+
+  async function save(patch) {
+    try {
+      await api('POST', '/api/home/operating/update', { job_key: row.job_key, ...patch });
+      loadFollowup();
+    } catch (e) { showError(detailCell, e.message); }
+  }
+
+  const prioritySelect = el('select', {
+    onchange: (ev) => save({ priority: ev.target.value === '—' ? null : ev.target.value }),
+  });
+  for (const p of PRIORITY_OPTIONS) prioritySelect.appendChild(el('option', { value: p, text: p }));
+  prioritySelect.value = op.priority || '—';
+
+  const lastTouchInput = el('input', { type: 'date', onchange: (ev) => save({ last_touch: ev.target.value || null }) });
+  if (op.last_touch) lastTouchInput.value = op.last_touch;
+
+  const nextActionInput = el('input', { type: 'text', placeholder: 'e.g. Follow up on outreach', onblur: (ev) => save({ next_action: ev.target.value || null }) });
+  nextActionInput.value = op.next_action || '';
+
+  const waitingOnInput = el('input', { type: 'text', placeholder: 'e.g. recruiter response', onblur: (ev) => save({ waiting_on: ev.target.value || null }) });
+  waitingOnInput.value = op.waiting_on || '';
+
+  const followUpInput = el('input', { type: 'date', onchange: (ev) => save({ follow_up_due: ev.target.value || null }) });
+  if (op.follow_up_due) followUpInput.value = op.follow_up_due;
+
+  const notesInput = el('input', { type: 'text', placeholder: 'notes', onblur: (ev) => save({ notes: ev.target.value || null }) });
+  notesInput.value = op.notes || '';
+
+  function quickBtn(label, days) {
+    return el('button', {
+      class: 'action',
+      text: label,
+      onclick: (ev) => { ev.stopPropagation(); followUpInput.value = addDaysLocalStr(days); save({ follow_up_due: addDaysLocalStr(days) }); },
+    });
+  }
+
+  const wrap = el('div', { class: 'fu-operating', onclick: (ev) => ev.stopPropagation(), style: 'margin:10px 0' });
+  wrap.appendChild(el('div', { class: 'meta', text: 'Operating:', style: 'margin-bottom:6px' }));
+  const grid = el('div', { class: 'fu-detail-grid' }, [
+    el('div', {}, [el('span', { text: 'Priority:' }), prioritySelect]),
+    el('div', {}, [el('span', { text: 'Last Touch:' }), lastTouchInput]),
+    el('div', {}, [el('span', { text: 'Next Action:' }), nextActionInput]),
+    el('div', {}, [el('span', { text: 'Waiting On:' }), waitingOnInput]),
+    el('div', {}, [el('span', { text: 'Notes:' }), notesInput]),
+  ]);
+  wrap.appendChild(grid);
+  const followUpRow = el('div', { class: 'row', style: 'margin-top:8px;gap:8px;align-items:center' }, [
+    el('span', { class: 'meta', text: 'Follow-Up Due:' }), followUpInput,
+  ]);
+  wrap.appendChild(followUpRow);
+  const quickRow = el('div', { class: 'row', style: 'margin-top:6px;gap:6px' }, [
+    quickBtn('Tomorrow', 1),
+    quickBtn('+3 days', 3),
+    quickBtn('+7 days', 7),
+    el('button', { class: 'action', text: 'Clear', onclick: (ev) => { ev.stopPropagation(); followUpInput.value = ''; save({ follow_up_due: null }); } }),
+  ]);
+  wrap.appendChild(quickRow);
+  return wrap;
+}
+
 // Inline Next Action / Follow-up editor (Pass 6): POST /api/home/action/update
 // — mutates ONLY row.action_id, the same id Mark Done/Skip already resolve
 // against (outreach.mjs's findFollowUpTarget), so this can never touch a
@@ -764,10 +868,10 @@ function renderActionControl(row, detailCell) {
 
   const actionSelect = el('select', {});
   for (const opt of NEXT_ACTION_OPTIONS) actionSelect.appendChild(el('option', { value: opt === '—' ? '' : opt, text: opt }));
-  actionSelect.value = row.next_action || '';
+  actionSelect.value = row.contact_next_action || '';
 
   const dateInput = el('input', { type: 'date' });
-  if (row.due_at) dateInput.value = row.due_at;
+  if (row.contact_due_at) dateInput.value = row.contact_due_at;
 
   async function save(nextAction, nextActionDue) {
     try {
@@ -778,17 +882,17 @@ function renderActionControl(row, detailCell) {
 
   actionSelect.addEventListener('change', (ev) => {
     const value = ev.target.value || null;
-    save(value, value === null ? null : (dateInput.value || row.due_at || null));
+    save(value, value === null ? null : (dateInput.value || row.contact_due_at || null));
   });
   dateInput.addEventListener('change', (ev) => {
-    save(actionSelect.value || row.next_action || 'FOLLOW_UP', ev.target.value || null);
+    save(actionSelect.value || row.contact_next_action || 'FOLLOW_UP', ev.target.value || null);
   });
 
   function quickBtn(label, days) {
     return el('button', {
       class: 'action',
       text: label,
-      onclick: (ev) => { ev.stopPropagation(); save(actionSelect.value || row.next_action || 'FOLLOW_UP', addDaysLocalStr(days)); },
+      onclick: (ev) => { ev.stopPropagation(); save(actionSelect.value || row.contact_next_action || 'FOLLOW_UP', addDaysLocalStr(days)); },
     });
   }
 
