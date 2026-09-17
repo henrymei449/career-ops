@@ -695,7 +695,7 @@ async function loadFollowup() {
 }
 
 function renderHomeRow(row) {
-  const tr = el('tr', { class: 'fu-row', onclick: () => {
+  const tr = el('tr', { class: 'fu-row', 'data-job-key': row.job_key, onclick: () => {
     state.followupExpanded = state.followupExpanded === row.job_key ? null : row.job_key;
     loadFollowup();
   } });
@@ -780,52 +780,157 @@ function renderStageControl(row, detailCell) {
   return select;
 }
 
-// Home operating-metadata MVP: Priority/Last Touch/Next Action/Waiting On/
-// Follow-Up Due/Notes, all POST /api/home/operating/update — the job-level
-// operator loop that works even on a row with zero contacts (row.contact_id
-// == null), unlike renderActionControl above. Prefills FROM row.operating
-// (the raw, unmerged job-level fields), never from the merged display
-// values (row.next_action/row.due_at), so a contact-derived fallback shown
-// in the top-level table is never echoed back into this editor as if it had
-// been explicitly set.
-function renderOperatingControls(row, detailCell) {
-  const op = row.operating || {};
+// Home operating-metadata fields — a closed list shared by the draft model
+// below and diffOperatingPatch()'s comparison.
+const OPERATING_FIELD_NAMES = ['priority', 'last_touch', 'next_action', 'waiting_on', 'follow_up_due', 'notes'];
 
-  async function save(patch) {
-    try {
-      await api('POST', '/api/home/operating/update', { job_key: row.job_key, ...patch });
-      loadFollowup();
-    } catch (e) { showError(detailCell, e.message); }
+// null/undefined/'' all mean "unset" for these fields (matches the backend's
+// own PATCH semantics — see updateJobOperatingMetadata), so normalize before
+// ever comparing draft vs persisted or a stale diff will report a change
+// that isn't really one.
+function normalizeOperatingValue(v) {
+  return v === undefined || v === null || v === '' ? null : v;
+}
+
+/** A fresh draft object seeded from row.operating (never from the merged
+ * display fields row.next_action/row.due_at — see the prefill note this
+ * function replaces). */
+function freshOperatingDraft(op) {
+  const draft = {};
+  for (const field of OPERATING_FIELD_NAMES) draft[field] = normalizeOperatingValue((op || {})[field]);
+  return draft;
+}
+
+/** Only the fields that actually changed vs persisted — the PATCH body. */
+function diffOperatingPatch(persisted, draft) {
+  const patch = {};
+  for (const field of OPERATING_FIELD_NAMES) {
+    if (normalizeOperatingValue(persisted[field]) !== normalizeOperatingValue(draft[field])) {
+      patch[field] = normalizeOperatingValue(draft[field]);
+    }
+  }
+  return patch;
+}
+
+// Home operating-metadata MVP: Priority/Last Touch/Next Action/Waiting On/
+// Follow-Up Due/Notes, one POST /api/home/operating/update per explicit
+// Save Changes click (never per-keystroke — see the "Home operating edit UX
+// hotfix" note below) — the job-level operator loop that works even on a
+// row with zero contacts (row.contact_id == null), unlike renderActionControl
+// above.
+//
+// Every control here writes to an in-memory draft only, seeded once from
+// row.operating (the raw, unmerged job-level fields — never the merged
+// display values row.next_action/row.due_at, so a contact-derived fallback
+// shown in the top-level table is never echoed back into this editor as if
+// it had been explicitly set). Nothing calls the backend or loadFollowup()
+// until Save Changes: editing used to fire one API call + one full Home
+// rerender per field (per blur/change), which tore down and rebuilt this
+// exact DOM subtree — collapsing the expanded row and losing the operator's
+// place after every single edit, the opposite of "easier than Excel". A
+// closure-local draft survives fine across edits because nothing rerenders
+// while editing; it's only reset (correctly) by the loadFollowup() call
+// Save Changes itself triggers on success, since that's a fresh render off
+// the just-saved server state.
+function renderOperatingControls(row, detailCell) {
+  const persisted = freshOperatingDraft(row.operating);
+  const draft = { ...persisted };
+
+  const prioritySelect = el('select', {});
+  for (const p of PRIORITY_OPTIONS) prioritySelect.appendChild(el('option', { value: p, text: p }));
+  prioritySelect.value = draft.priority || '—';
+
+  const lastTouchInput = el('input', { type: 'date' });
+  if (draft.last_touch) lastTouchInput.value = draft.last_touch;
+
+  const nextActionInput = el('input', { type: 'text', placeholder: 'e.g. Follow up on outreach' });
+  nextActionInput.value = draft.next_action || '';
+
+  const waitingOnInput = el('input', { type: 'text', placeholder: 'e.g. recruiter response' });
+  waitingOnInput.value = draft.waiting_on || '';
+
+  const followUpInput = el('input', { type: 'date' });
+  if (draft.follow_up_due) followUpInput.value = draft.follow_up_due;
+
+  const notesInput = el('input', { type: 'text', placeholder: 'notes' });
+  notesInput.value = draft.notes || '';
+
+  const unsavedEl = el('span', { class: 'meta fu-unsaved', text: 'Unsaved changes', style: 'display:none;color:#8a6300;margin-left:8px' });
+  const statusEl = el('span', { class: 'meta fu-save-status', style: 'margin-left:8px' });
+  const saveBtn = el('button', { class: 'action primary', text: 'Save Changes' });
+  saveBtn.disabled = true;
+  const cancelBtn = el('button', { class: 'action', text: 'Cancel' });
+
+  function refreshDirtyState() {
+    const dirty = Object.keys(diffOperatingPatch(persisted, draft)).length > 0;
+    saveBtn.disabled = !dirty;
+    unsavedEl.style.display = dirty ? '' : 'none';
   }
 
-  const prioritySelect = el('select', {
-    onchange: (ev) => save({ priority: ev.target.value === '—' ? null : ev.target.value }),
-  });
-  for (const p of PRIORITY_OPTIONS) prioritySelect.appendChild(el('option', { value: p, text: p }));
-  prioritySelect.value = op.priority || '—';
+  // Every control here is draft-only: it updates `draft` and re-derives
+  // dirty state, and nothing else. No fetch, no loadFollowup().
+  prioritySelect.addEventListener('change', (ev) => { draft.priority = ev.target.value === '—' ? null : ev.target.value; refreshDirtyState(); });
+  lastTouchInput.addEventListener('change', (ev) => { draft.last_touch = ev.target.value || null; refreshDirtyState(); });
+  nextActionInput.addEventListener('input', (ev) => { draft.next_action = ev.target.value || null; refreshDirtyState(); });
+  waitingOnInput.addEventListener('input', (ev) => { draft.waiting_on = ev.target.value || null; refreshDirtyState(); });
+  followUpInput.addEventListener('change', (ev) => { draft.follow_up_due = ev.target.value || null; refreshDirtyState(); });
+  notesInput.addEventListener('input', (ev) => { draft.notes = ev.target.value || null; refreshDirtyState(); });
 
-  const lastTouchInput = el('input', { type: 'date', onchange: (ev) => save({ last_touch: ev.target.value || null }) });
-  if (op.last_touch) lastTouchInput.value = op.last_touch;
-
-  const nextActionInput = el('input', { type: 'text', placeholder: 'e.g. Follow up on outreach', onblur: (ev) => save({ next_action: ev.target.value || null }) });
-  nextActionInput.value = op.next_action || '';
-
-  const waitingOnInput = el('input', { type: 'text', placeholder: 'e.g. recruiter response', onblur: (ev) => save({ waiting_on: ev.target.value || null }) });
-  waitingOnInput.value = op.waiting_on || '';
-
-  const followUpInput = el('input', { type: 'date', onchange: (ev) => save({ follow_up_due: ev.target.value || null }) });
-  if (op.follow_up_due) followUpInput.value = op.follow_up_due;
-
-  const notesInput = el('input', { type: 'text', placeholder: 'notes', onblur: (ev) => save({ notes: ev.target.value || null }) });
-  notesInput.value = op.notes || '';
+  function setFollowUpDraft(value) {
+    draft.follow_up_due = value;
+    followUpInput.value = value || '';
+    refreshDirtyState();
+  }
 
   function quickBtn(label, days) {
     return el('button', {
       class: 'action',
       text: label,
-      onclick: (ev) => { ev.stopPropagation(); followUpInput.value = addDaysLocalStr(days); save({ follow_up_due: addDaysLocalStr(days) }); },
+      onclick: (ev) => { ev.stopPropagation(); setFollowUpDraft(addDaysLocalStr(days)); },
     });
   }
+
+  cancelBtn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    Object.assign(draft, persisted);
+    prioritySelect.value = draft.priority || '—';
+    lastTouchInput.value = draft.last_touch || '';
+    nextActionInput.value = draft.next_action || '';
+    waitingOnInput.value = draft.waiting_on || '';
+    followUpInput.value = draft.follow_up_due || '';
+    notesInput.value = draft.notes || '';
+    statusEl.textContent = '';
+    refreshDirtyState();
+  });
+
+  saveBtn.addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    const patch = diffOperatingPatch(persisted, draft);
+    if (Object.keys(patch).length === 0) return;
+    saveBtn.disabled = true;
+    cancelBtn.disabled = true;
+    statusEl.textContent = 'Saving…';
+    try {
+      await api('POST', '/api/home/operating/update', { job_key: row.job_key, ...patch });
+      statusEl.textContent = 'Saved';
+      // A brief pause so "Saved" is actually visible before the one
+      // intentional reload below replaces this DOM subtree — Home rebuilds
+      // from the just-saved server state, and since state.followupExpanded
+      // is untouched by a save, this same row reopens automatically if
+      // it's still in the active filter (spec sections 10-11); if the save
+      // moved its bucket out of the current filter, it correctly
+      // disappears instead of being forced visible.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      loadFollowup();
+    } catch (e) {
+      // Draft stays intact, row stays expanded — no loadFollowup() call on
+      // failure, so nothing here gets torn down.
+      cancelBtn.disabled = false;
+      statusEl.textContent = '';
+      refreshDirtyState();
+      showError(detailCell, e.message);
+    }
+  });
 
   const wrap = el('div', { class: 'fu-operating', onclick: (ev) => ev.stopPropagation(), style: 'margin:10px 0' });
   wrap.appendChild(el('div', { class: 'meta', text: 'Operating:', style: 'margin-bottom:6px' }));
@@ -845,9 +950,13 @@ function renderOperatingControls(row, detailCell) {
     quickBtn('Tomorrow', 1),
     quickBtn('+3 days', 3),
     quickBtn('+7 days', 7),
-    el('button', { class: 'action', text: 'Clear', onclick: (ev) => { ev.stopPropagation(); followUpInput.value = ''; save({ follow_up_due: null }); } }),
+    el('button', { class: 'action', text: 'Clear', onclick: (ev) => { ev.stopPropagation(); setFollowUpDraft(null); } }),
   ]);
   wrap.appendChild(quickRow);
+  const saveRow = el('div', { class: 'row', style: 'margin-top:10px;gap:8px;align-items:center' }, [
+    saveBtn, cancelBtn, unsavedEl, statusEl,
+  ]);
+  wrap.appendChild(saveRow);
   return wrap;
 }
 
