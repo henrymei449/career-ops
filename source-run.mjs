@@ -29,6 +29,7 @@
  * user-owned operational data (Data Contract), not shared repo code.
  */
 import { execFileSync } from 'child_process';
+import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -187,13 +188,53 @@ export function runSourceToReview({ source, receipts, root, runId }) {
   return result;
 }
 
+/**
+ * Read a receipt (or array of receipts) from a JSON file — the
+ * source-agnostic entry point for a caller that already ran its own
+ * discovery (any shape: a scan.mjs `careerops.scan.receipt`, an
+ * append-pipeline-entry.mjs `appendOffers()` result, or anything else with
+ * `added`/`added_urls`, since summarizeReceipts() only ever reads those two
+ * fields) and wants to hand its survivors to the shared handoff without
+ * this module re-running that discovery itself.
+ *
+ * @param {string} filePath
+ * @returns {object[]}
+ */
+export function readReceiptFile(filePath) {
+  const raw = JSON.parse(readFileSync(filePath, 'utf-8'));
+  return Array.isArray(raw) ? raw : [raw];
+}
+
 if (isMainModule(import.meta.url)) {
   const argv = process.argv.slice(2);
   const source = argv[0];
   const since = flagValue(argv, '--since');
   const root = getCareerOpsRoot();
+  const fromReceiptPath = flagValue(argv, '--from-receipt');
 
-  if (source === 'linkedin') {
+  if (fromReceiptPath) {
+    // Generic path: any caller (a scheduler wrapper, a future source) that
+    // already produced its own receipt(s) hands them straight to the same
+    // shared handoff every other source uses — no re-discovery, no second
+    // Review implementation. `--source` names the batch's source label.
+    const receiptSource = flagValue(argv, '--source');
+    if (!receiptSource) {
+      console.error('Usage: node source-run.mjs --from-receipt <path> --source <name>');
+      process.exitCode = 1;
+    } else {
+      let result;
+      try {
+        const receipts = readReceiptFile(fromReceiptPath);
+        result = runSourceToReview({ source: receiptSource, receipts, root });
+      } catch (err) {
+        console.log(JSON.stringify({ source: receiptSource, status: 'incomplete', error: String(err?.message || err) }, null, 2));
+        process.exitCode = 1;
+        throw err;
+      }
+      console.log(JSON.stringify(result, null, 2));
+      if (result.status === 'incomplete') process.exitCode = 1;
+    }
+  } else if (source === 'linkedin') {
     let result;
     try {
       const receipt = runScanForCompany('LinkedIn', { since, root });
@@ -207,11 +248,16 @@ if (isMainModule(import.meta.url)) {
     if (result.status === 'incomplete') process.exitCode = 1;
   } else {
     console.error(
-      'Usage: node source-run.mjs linkedin [--since N]\n\n' +
+      'Usage: node source-run.mjs linkedin [--since N]\n' +
+      '       node source-run.mjs --from-receipt <path> --source <name>\n\n' +
       '"strategic" and "vc" run through their existing cohort runners in the data ' +
       'root (run-recurring-cohort.mjs, run-vc-portfolio-cohort.mjs), which call ' +
       'runSourceToReview() themselves at the end of their own per-company loop — ' +
-      'their company lists are user-owned operational data, not shared repo code.',
+      'their company lists are user-owned operational data, not shared repo code. ' +
+      '--from-receipt is for any other caller that already has a receipt-shaped ' +
+      'result (a scan.mjs receipt, an append-pipeline-entry.mjs result, etc.) and ' +
+      'wants it folded into the same canonical Review handoff without this module ' +
+      're-running the discovery itself.',
     );
     process.exitCode = 1;
   }

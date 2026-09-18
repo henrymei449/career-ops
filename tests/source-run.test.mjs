@@ -9,11 +9,15 @@
 
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
+import { execFileSync } from 'child_process';
 import { pass, fail, finish } from './helpers.mjs';
 
-import { summarizeReceipts, createReviewBatchForSource, runSourceToReview } from '../source-run.mjs';
+import { summarizeReceipts, createReviewBatchForSource, runSourceToReview, readReceiptFile } from '../source-run.mjs';
 import { loadOpenBatch } from '../review.mjs';
+
+const SOURCE_RUN_PATH = fileURLToPath(new URL('../source-run.mjs', import.meta.url));
 
 function scratchRoot() {
   return mkdtempSync(join(tmpdir(), 'co-source-run-test-'));
@@ -196,6 +200,72 @@ async function main() {
     if (result.status === 'incomplete' && result.batch_id === null) {
       pass('survivors that cannot be resolved into batch jobs mark the run incomplete, not success');
     } else fail(`expected incomplete/null batch_id, got ${JSON.stringify(result)}`);
+  }
+
+  // ── readReceiptFile: the --from-receipt CLI's file-loading half ─────────
+  {
+    const root = scratchRoot();
+    const filePath = join(root, 'receipt.json');
+    writeFileSync(filePath, JSON.stringify(receipt({ found: 4, filtered: 3, added: 1, added_urls: ['local:jds/single.md'] })));
+    const loaded = readReceiptFile(filePath);
+    if (Array.isArray(loaded) && loaded.length === 1 && loaded[0].added === 1) {
+      pass('readReceiptFile: a single receipt object is wrapped in an array');
+    } else fail(`readReceiptFile: expected a 1-element array, got ${JSON.stringify(loaded)}`);
+  }
+  {
+    const root = scratchRoot();
+    const filePath = join(root, 'receipts.json');
+    writeFileSync(filePath, JSON.stringify([receipt({ added: 1, added_urls: ['local:jds/a.md'] }), receipt({ added: 1, added_urls: ['local:jds/b.md'] })]));
+    const loaded = readReceiptFile(filePath);
+    if (Array.isArray(loaded) && loaded.length === 2) {
+      pass('readReceiptFile: an array of receipts passes through unchanged');
+    } else fail(`readReceiptFile: expected a 2-element array, got ${JSON.stringify(loaded)}`);
+  }
+
+  // ── Source-agnostic input shape: a non-scan.mjs receipt (no `found`/
+  // `filtered` fields — e.g. append-pipeline-entry.mjs's appendOffers()
+  // result) must still fold into a canonical batch on `added`/`added_urls`
+  // alone, proving the shared handoff owns no source-specific receipt schema.
+  {
+    const root = scratchRoot();
+    const urls = ['local:jds/handoff-a.md', 'local:jds/handoff-b.md'];
+    seedPipeline(root, urls);
+    // Deliberately NOT built via receipt() — no `found`/`filtered`/`version`,
+    // matching appendOffers()'s real return shape exactly.
+    const appendPipelineEntryResult = { added: 2, added_urls: urls, skipped_duplicate: [], skipped_invalid: [] };
+    const result = runSourceToReview({ source: 'strategic', receipts: [appendPipelineEntryResult], root });
+    if (result.status === 'ok' && result.batch_id && result.survivor_count === 2) {
+      pass('a non-scan.mjs receipt shape (append-pipeline-entry.mjs style) still produces one canonical batch');
+    } else fail(`append-pipeline-entry-shaped receipt: expected ok+batch_id+survivor_count 2, got ${JSON.stringify(result)}`);
+  }
+
+  // ── Machine portability: the --from-receipt CLI must not depend on being
+  // invoked from this repo's own checkout directory or any hardcoded path.
+  // Spawns it as a REAL subprocess with cwd set somewhere else entirely (the
+  // OS temp dir, not D:\career-ops) and CAREER_OPS_DATA_DIR pointing at an
+  // isolated scratch root, proving module resolution (relative imports off
+  // source-run.mjs's own file URL) and data-root resolution both work
+  // regardless of working directory.
+  {
+    const root = scratchRoot();
+    const urls = ['local:jds/portable.md'];
+    seedPipeline(root, urls);
+    const receiptPath = join(root, 'portable-receipt.json');
+    writeFileSync(receiptPath, JSON.stringify(receipt({ found: 1, filtered: 0, added: 1, added_urls: urls })));
+    const cwdElsewhere = mkdtempSync(join(tmpdir(), 'co-source-run-cwd-elsewhere-'));
+
+    const out = execFileSync(
+      process.execPath,
+      [SOURCE_RUN_PATH, '--from-receipt', receiptPath, '--source', 'linkedin'],
+      { cwd: cwdElsewhere, encoding: 'utf-8', env: { ...process.env, CAREER_OPS_DATA_DIR: root, CAREER_OPS_ROOT: '' } },
+    );
+    let parsed;
+    try { parsed = JSON.parse(out); } catch { parsed = null; }
+    if (parsed?.status === 'ok' && parsed?.batch_id) {
+      pass('--from-receipt works as a subprocess from an arbitrary cwd (no hardcoded repo path)');
+    } else {
+      fail(`--from-receipt portability check failed: ${out}`);
+    }
   }
 
   // ── summarizeReceipts: pure aggregation sanity ───────────────────────────
