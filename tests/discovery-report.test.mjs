@@ -152,22 +152,22 @@ test('renderReport: empty PASS/MARGINAL tables print "_None this run._" rather t
   assert.match(md, /_None this run\._/);
 });
 
-test('renderReport: top100 kind includes the Employer Coverage section; linkedin kind does not', () => {
+test('renderReport: target-companies kind includes the Employer Coverage section; linkedin kind does not', () => {
   const base = {
     date: '2026-09-10', runStartedAt: 'a', runFinishedAt: 'b', sinceDays: null, modelUsed: 'claude-sonnet-5',
     funnel: { rawJobs: 0, freshnessRejects: 0, duplicates: 0, cheapFilterRejects: 0, netNew: 0 },
     pass: [], marginal: [], excludedCount: 0, notes: [], generatedAt: '2026-09-10T23:00:00.000Z',
   };
-  const top100Md = renderReport({
-    ...base, kind: 'top100',
+  const targetCompaniesMd = renderReport({
+    ...base, kind: 'target-companies',
     cohort: { providerBacked: ['Manufacturo'], handoffAttempted: ['Siemens Digital Industries Software'], blockedUnresolved: [{ name: 'CubeFabs', reason: 'Playwright timeout' }] },
   });
-  assert.match(top100Md, /## 6\. Top-100 Employer Coverage/);
-  assert.match(top100Md, /Provider-backed, completed: 1/);
-  assert.match(top100Md, /CubeFabs — Playwright timeout/);
+  assert.match(targetCompaniesMd, /## 6\. Target Companies Employer Coverage/);
+  assert.match(targetCompaniesMd, /Provider-backed, completed: 1/);
+  assert.match(targetCompaniesMd, /CubeFabs — Playwright timeout/);
 
   const linkedinMd = renderReport({ ...base, kind: 'linkedin', cohort: null });
-  assert.doesNotMatch(linkedinMd, /Top-100 Employer Coverage/);
+  assert.doesNotMatch(linkedinMd, /Target Companies Employer Coverage/);
 });
 
 // ── buildReport() / CLI — subprocess against a fresh temp data root ────

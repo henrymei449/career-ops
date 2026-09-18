@@ -47,7 +47,7 @@ const SAMPLE_OFFER = {
   title: 'Solutions Engineer',
   company: 'Acme Manufacturing',
   location: 'New York, NY',
-  source: 'Top100 Handoff — WebSearch',
+  source: 'Target Companies Handoff — WebSearch',
   postedAt: '2026-09-08',
   note: 'found via handoff',
 };

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * discovery-report.mjs — renders the human review Markdown report for a
- * scheduled discovery run (LinkedIn or Top-100 targeted).
+ * scheduled discovery run (LinkedIn or Target Companies).
  *
  * Reuses existing, already-persisted artifacts rather than inventing a new
  * receipt schema:
@@ -18,7 +18,7 @@
  *                              (not a new scoring model).
  *
  * scan.mjs's own --json receipt supplies added_urls/errors for one
- * invocation; a caller with several (the Top-100 cohort runs one scan.mjs
+ * invocation; a caller with several (the Target Companies cohort runs one scan.mjs
  * process per company) passes all of them in `receipts`.
  *
  * The report is written to {DATA_ROOT}/reports/discovery/{date}_{kind}.md —
@@ -30,15 +30,15 @@
  *
  * Payload shape — see README below for full field docs:
  *   {
- *     "kind": "linkedin" | "top100",
+ *     "kind": "linkedin" | "target-companies",
  *     "date": "YYYY-MM-DD",           // optional, default: local today
  *     "runStartedAt": "ISO",          // required
  *     "runFinishedAt": "ISO",         // optional, default: now
  *     "sinceDays": 2,                  // optional (linkedin)
- *     "model": "claude-sonnet-5",     // optional (top100, when handoff ran)
+ *     "model": "claude-sonnet-5",     // optional (target-companies, when handoff ran)
  *     "receipts": [ <scan.mjs --json receipt>, ... ],
  *     "handoff": <append-pipeline-entry.mjs --json receipt> | null,
- *     "cohort": {                      // optional (top100)
+ *     "cohort": {                      // optional (target-companies)
  *       "providerBacked": ["Manufacturo", ...],
  *       "handoffAttempted": ["Siemens Digital Industries Software", ...],
  *       "blockedUnresolved": [{ "name": "...", "reason": "..." }]
@@ -59,7 +59,7 @@ export const SCAN_RUNS_PATH = process.env.CAREER_OPS_SCAN_RUNS || join(DATA_ROOT
 export const SCAN_HISTORY_PATH = process.env.CAREER_OPS_SCAN_HISTORY || join(DATA_ROOT, 'data/scan-history.tsv');
 export const REPORTS_DIR = join(DATA_ROOT, 'reports/discovery');
 
-const KIND_LABELS = { linkedin: 'LinkedIn Discovery', top100: 'Top-100 Targeted Discovery' };
+const KIND_LABELS = { linkedin: 'LinkedIn Discovery', 'target-companies': 'Target Companies Discovery' };
 
 // PowerShell's `-Encoding utf8` (Set-Content/Out-File, PS 5.1) writes a UTF-8
 // byte-order mark, which JSON.parse rejects outright. Every payload/asset
@@ -278,8 +278,8 @@ export function renderReport(model) {
   if (excludedCount > 0) allNotes.push(`${excludedCount} net-new posting(s) excluded from review as non-US/noise (not listed above).`);
   lines.push(allNotes.length > 0 ? allNotes.map((n) => `- ${n}`).join('\n') : '_None._', '');
 
-  if (kind === 'top100' && cohort) {
-    lines.push('## 6. Top-100 Employer Coverage', '');
+  if (kind === 'target-companies' && cohort) {
+    lines.push('## 6. Target Companies Employer Coverage', '');
     lines.push(`- Provider-backed, completed: ${cohort.providerBacked.length}`);
     if (cohort.providerBacked.length > 0) lines.push(`  ${cohort.providerBacked.join(', ')}`);
     lines.push(`- WebSearch/Playwright handoff, completed: ${cohort.handoffAttempted.length}`);
@@ -307,8 +307,8 @@ function aggregateReceiptErrors(receipts) {
  */
 export function buildReport(payload) {
   const kind = payload.kind;
-  if (kind !== 'linkedin' && kind !== 'top100') {
-    throw new Error(`payload.kind must be "linkedin" or "top100", got ${JSON.stringify(kind)}`);
+  if (kind !== 'linkedin' && kind !== 'target-companies') {
+    throw new Error(`payload.kind must be "linkedin" or "target-companies", got ${JSON.stringify(kind)}`);
   }
   if (!payload.runStartedAt) throw new Error('payload.runStartedAt is required');
 
@@ -354,7 +354,7 @@ export function buildReport(payload) {
     marginal,
     excludedCount: excluded.length,
     notes,
-    cohort: kind === 'top100' ? {
+    cohort: kind === 'target-companies' ? {
       providerBacked: payload.cohort?.providerBacked || [],
       handoffAttempted: payload.cohort?.handoffAttempted || [],
       blockedUnresolved: payload.cohort?.blockedUnresolved || [],

@@ -34,7 +34,7 @@
  *     "location": "...",           // optional
  *     "source": "...",             // optional; the scan-history "portal"
  *                                  // column — label your discovery method,
- *                                  // e.g. "Top100 Handoff — WebSearch"
+ *                                  // e.g. "Target Companies Handoff — WebSearch"
  *     "postedAt": "YYYY-MM-DD",    // optional ISO date
  *     "description": "...",       // optional; feeds the cross-listing
  *                                  // fingerprint the same way a provider's
@@ -44,7 +44,7 @@
  *                                  // Omitted -> "unknown", NEVER "keyword" --
  *                                  // this CLI is used by paths that bypass
  *                                  // keyword discovery entirely (e.g. the
- *                                  // Top-100 handoff is "external_handoff").
+ *                                  // Target Companies handoff is "external_handoff").
  *                                  // Threaded into the pipeline.md note as
  *                                  // discovery_lane={value} for the
  *                                  // evaluating agent to copy into the
@@ -95,7 +95,7 @@ const URL_RE = /^(https?:\/\/|local:)/i;
 
 // Explicit discovery-provenance enum. A caller that omits discoveryLane gets
 // 'unknown' here, NEVER 'keyword' — this CLI is used by paths that
-// deliberately bypass keyword discovery entirely (the Top-100 headless
+// deliberately bypass keyword discovery entirely (the Target Companies headless
 // WebSearch/browser-extract handoff is 'external_handoff'), and silently
 // defaulting an unlabeled offer to 'keyword' would misattribute it for any
 // later keyword-vs-semantic_recall conversion analysis.
