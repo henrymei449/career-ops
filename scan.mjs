@@ -265,6 +265,75 @@ export function buildTitleFilterWithOverrides(titleFilter, overridesMap) {
   };
 }
 
+// ── Title lanes ─────────────────────────────────────────────────────
+// Optional. `title_filter_lanes` in portals.yml adds a SEPARATE, company-scoped
+// title lane on top of title_filter (+ title_filter_overrides) without touching
+// either: a title that already passes the existing gate is unaffected and never
+// consults a lane. A lane admits a title only when
+//   - the company is listed in the lane's `companies` (exact, case-insensitive),
+//   - no global title_filter.negative keyword matches (same veto overrides get),
+//   - no lane-scoped `negative` keyword matches (these apply to the lane ONLY,
+//     so a lane can exclude entry-level / shop-floor noise without changing what
+//     the existing gate accepts), and
+//   - any lane `positive` keyword matches (same syntax as positive_extra:
+//     substring, `word:`, and "A + B" AND-groups).
+// Shape:
+//   title_filter_lanes:
+//     - name: semiconductor_lane_b
+//       companies: ["KLA Corporation", ...]
+//       positive: ["manufacturing engineer", ...]
+//       negative: ["co-op", "word:director", ...]
+//       global_negative_exceptions: ["production supervisor", ...]   # global negatives this lane does not inherit
+//       fallback_queries: ['"Manufacturing Engineer"', ...]   # read by official-domain-search only
+export function buildTitleLanes(lanes) {
+  const out = [];
+  if (!Array.isArray(lanes)) return out;
+  const compileList = (arr, compile) => (Array.isArray(arr) ? arr : [])
+    .filter(k => typeof k === 'string')
+    .map(k => k.trim().toLowerCase())
+    .filter(k => k.length > 0)
+    .map(compile);
+  for (const lane of lanes) {
+    if (!lane || typeof lane !== 'object' || Array.isArray(lane)) continue;
+    if (typeof lane.name !== 'string' || !lane.name.trim()) continue;
+    const positive = compileList(lane.positive, compilePositiveKeyword);
+    if (positive.length === 0) continue; // nothing to admit
+    const companies = new Set((Array.isArray(lane.companies) ? lane.companies : [])
+      .filter(c => typeof c === 'string' && c.trim())
+      .map(c => c.trim().toLowerCase()));
+    if (companies.size === 0) continue; // lanes are always company-scoped
+    // Global negatives this lane deliberately does NOT inherit (exact keyword, case-insensitive).
+    // The global list itself is never modified; other lanes and Lane A still see every entry.
+    const globalNegativeExceptions = new Set((Array.isArray(lane.global_negative_exceptions) ? lane.global_negative_exceptions : [])
+      .filter(k => typeof k === 'string' && k.trim())
+      .map(k => k.trim().toLowerCase()));
+    out.push({ name: lane.name.trim(), companies, positive, negative: compileList(lane.negative, compileKeyword), globalNegativeExceptions });
+  }
+  return out;
+}
+
+// Returns (title, companySlug) => laneName | null (first admitting lane wins).
+export function buildLaneTitleFilter(titleFilter, laneDefs) {
+  const lanes = Array.isArray(laneDefs) ? laneDefs : [];
+  if (lanes.length === 0) return () => null;
+  const globalNegative = (Array.isArray(titleFilter?.negative) ? titleFilter.negative : [])
+    .filter(k => typeof k === 'string')
+    .map(k => k.trim().toLowerCase())
+    .filter(k => k.length > 0)
+    .map(kw => ({ kw, match: compileKeyword(kw) }));
+  return (title, companySlug) => {
+    const lower = String(title ?? '').toLowerCase();
+    const company = String(companySlug ?? '').trim().toLowerCase();
+    for (const lane of lanes) {
+      if (!lane.companies.has(company)) continue;
+      if (globalNegative.some(n => !lane.globalNegativeExceptions.has(n.kw) && n.match(lower))) continue;
+      if (lane.negative.some(m => m(lower))) continue;
+      if (lane.positive.some(m => m(lower))) return lane.name;
+    }
+    return null;
+  };
+}
+
 // Compiled-matcher cache for matchedTitleKeywords(), keyed by the
 // `title_filter.positive` array reference. The scan loop calls this once per
 // job with the same titleFilter config object, so caching avoids recompiling
@@ -3094,6 +3163,10 @@ async function main() {
   const boards = Array.isArray(config.job_boards) ? config.job_boards : [];
   const titleFilterOverrides = buildTitleFilterOverrides(config.title_filter_overrides);
   const titleFilter = buildTitleFilterWithOverrides(config.title_filter, titleFilterOverrides);
+  // Separate company-scoped title lanes (title_filter_lanes). Consulted ONLY for a
+  // title the existing gate above rejected, so existing behavior is unchanged.
+  const titleLaneOf = buildLaneTitleFilter(config.title_filter, buildTitleLanes(config.title_filter_lanes));
+  const titleLaneAdmits = new Map();
 
   // Seniority tier classifier integration
   let classifyTier = null;
@@ -3313,6 +3386,11 @@ async function main() {
       sinceDays,
       includeUndated: true,
       locationHints: config.location_filter,
+      // Raw title_filter_overrides, for providers (official-domain-search) that
+      // derive their search queries from the approved per-company title
+      // vocabulary rather than carrying a second copy of it.
+      titleFilterOverridesRaw: config.title_filter_overrides,
+      titleFilterLanesRaw: config.title_filter_lanes,
     };
     let sourceName = provider.id === 'local-parser' ? 'local-parser' : `${provider.id}-api`;
     const timingStartedAt = timing ? Date.now() : 0;
@@ -3374,7 +3452,9 @@ async function main() {
           }
         }
 
-        if (!titleFilter(job.title, company.name)) {
+        const passedExistingTitleGate = titleFilter(job.title, company.name);
+        const titleLane = passedExistingTitleGate ? null : titleLaneOf(job.title, company.name);
+        if (!passedExistingTitleGate && !titleLane) {
           totalFilteredTitle++;
           if (captureRecallRejects && !dryRun) {
             // No-fetch eligibility (tier/location_filter/posting-age/posted-
@@ -3406,6 +3486,12 @@ async function main() {
         job.note = typeof job.note === 'string' && job.note.trim()
           ? `${job.note} — discovery_lane=keyword`
           : 'discovery_lane=keyword';
+        if (titleLane) {
+          // Explicit provenance for a job admitted by a title lane rather than the
+          // existing gate; Lane-A-style admits carry no extra tag.
+          job.note = `${job.note} — title_lane=${titleLane}`;
+          titleLaneAdmits.set(titleLane, (titleLaneAdmits.get(titleLane) || 0) + 1);
+        }
         if (classifyTier && skipTiers.includes(classifyTier(job.title))) {
           totalFilteredTier++;
           continue;
@@ -3680,6 +3766,7 @@ async function main() {
   console.log(`Total jobs found:      ${totalFound}`);
   if (config.title_filter || totalFilteredTitle > 0) {
     console.log(`Filtered by title:     ${totalFilteredTitle} removed`);
+    for (const [laneName, n] of titleLaneAdmits) console.log(`Title lane admits:    ${n} (${laneName})`);
   }
   if (skipTiers.length > 0) {
     console.log(`Filtered by tier:      ${totalFilteredTier} removed`);

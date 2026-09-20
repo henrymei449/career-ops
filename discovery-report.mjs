@@ -30,7 +30,7 @@
  *
  * Payload shape — see README below for full field docs:
  *   {
- *     "kind": "linkedin" | "target-companies",
+ *     "kind": "linkedin" | "target-companies" | "vc" | "semiconductor",
  *     "date": "YYYY-MM-DD",           // optional, default: local today
  *     "runStartedAt": "ISO",          // required
  *     "runFinishedAt": "ISO",         // optional, default: now
@@ -59,7 +59,7 @@ export const SCAN_RUNS_PATH = process.env.CAREER_OPS_SCAN_RUNS || join(DATA_ROOT
 export const SCAN_HISTORY_PATH = process.env.CAREER_OPS_SCAN_HISTORY || join(DATA_ROOT, 'data/scan-history.tsv');
 export const REPORTS_DIR = join(DATA_ROOT, 'reports/discovery');
 
-const KIND_LABELS = { linkedin: 'LinkedIn Discovery', 'target-companies': 'Target Companies Discovery' };
+const KIND_LABELS = { linkedin: 'LinkedIn Discovery', 'target-companies': 'Target Companies Discovery', vc: 'Startup/VC Portfolio Discovery', semiconductor: 'Semiconductor Discovery' };
 
 // PowerShell's `-Encoding utf8` (Set-Content/Out-File, PS 5.1) writes a UTF-8
 // byte-order mark, which JSON.parse rejects outright. Every payload/asset
@@ -224,14 +224,35 @@ function escapeCell(value) {
   return String(value ?? '').replace(/[\r\n]+/g, ' ').replace(/\|/g, '\\|').trim();
 }
 
+// Title-lane provenance for a semiconductor run. scan.mjs tags a job admitted by a
+// title lane with `title_lane=<name>` in its pipeline.md note; the absence of that
+// tag means the existing gate (Lane A) admitted it. Read-only: pipeline.md is only read.
+export function attachTitleLanes(candidates, pipelineText) {
+  let text = pipelineText;
+  if (text == null) {
+    const p = join(DATA_ROOT, 'data/pipeline.md');
+    text = existsSync(p) ? readFileSync(p, 'utf-8') : '';
+  }
+  const lines = String(text).split('\n');
+  for (const c of candidates) {
+    const line = lines.find((l) => c.url && l.includes(c.url));
+    const m = line && /title_lane=([A-Za-z0-9_]+)/.exec(line);
+    c.lane = m ? (m[1] === 'semiconductor_lane_b' ? 'B' : m[1]) : 'A';
+  }
+  return candidates;
+}
+
 function renderCandidateTable(rows) {
   if (rows.length === 0) return '_None this run._\n';
-  const header = '| Company | Role | Direct Link | Structured Location | Location Tier | Fit | Why |\n'
-    + '|---|---|---|---|---|---|---|\n';
+  // A "Title Lane" column appears only when the run attributes lanes (semiconductor).
+  const withLane = rows.some((r) => r.lane);
+  const header = `| Company | Role | Direct Link | Structured Location | Location Tier | Fit | ${withLane ? 'Title Lane | ' : ''}Why |\n`
+    + `|---|---|---|---|---|---|${withLane ? '---|' : ''}---|\n`;
   const body = rows.map((r) => {
     const link = r.url.startsWith('local:') ? escapeCell(r.url) : `[Apply](${r.url})`;
     const tierLabel = `Tier ${r.tier} — ${BUCKET_LABEL[r.bucket] || r.bucket}`;
-    return `| ${escapeCell(r.company)} | ${escapeCell(r.title)} | ${link} | ${escapeCell(r.location) || '—'} | ${tierLabel} | ${escapeCell(r.source) || '—'} | ${escapeCell(r.why)} |`;
+    const laneCell = withLane ? `${escapeCell(r.lane || '—')} | ` : '';
+    return `| ${escapeCell(r.company)} | ${escapeCell(r.title)} | ${link} | ${escapeCell(r.location) || '—'} | ${tierLabel} | ${escapeCell(r.source) || '—'} | ${laneCell}${escapeCell(r.why)} |`;
   }).join('\n');
   return header + body + '\n';
 }
@@ -289,6 +310,28 @@ export function renderReport(model) {
     lines.push('');
   }
 
+  if (kind === 'semiconductor' && cohort) {
+    lines.push('## 6. Semiconductor Cohort Coverage', '');
+    const laneOf = (r) => r.lane || null;
+    const laned = [...pass, ...marginal].filter(laneOf);
+    if (laned.length > 0) {
+      const byLane = laned.reduce((m, r) => (m[r.lane] = (m[r.lane] || 0) + 1, m), {});
+      lines.push(`- Survivors by title lane: ${Object.entries(byLane).map(([k, v]) => `${k} ${v}`).join(', ')}`);
+    }
+    lines.push(`- Total cohort: ${cohort.total ?? '—'}`);
+    lines.push(`- Provider-backed: ${cohort.providerBacked.length}`);
+    if (cohort.providerBacked.length > 0) lines.push(`  ${cohort.providerBacked.join(', ')}`);
+    lines.push(`- Fallback-backed: ${cohort.fallbackBacked.length}`);
+    for (const f of cohort.fallbackBacked) lines.push(`  - ${f.name} — ${f.path}`);
+    lines.push(`- Deferred: ${cohort.deferred.length}`);
+    for (const d of cohort.deferred) lines.push(`  - ${d.name} — ${d.status}${d.reason ? ` (${d.reason})` : ''}`);
+    lines.push(`- Provider failures: ${cohort.providerFailures.length}`);
+    for (const f of cohort.providerFailures) lines.push(`  - ${f.name}${f.error ? ` — ${f.error}` : ''}`);
+    lines.push(`- Fallback failures: ${cohort.fallbackFailures.length}`);
+    for (const f of cohort.fallbackFailures) lines.push(`  - ${f.name}${f.error ? ` — ${f.error}` : ''}`);
+    lines.push('');
+  }
+
   return lines.join('\n');
 }
 
@@ -307,8 +350,8 @@ function aggregateReceiptErrors(receipts) {
  */
 export function buildReport(payload) {
   const kind = payload.kind;
-  if (kind !== 'linkedin' && kind !== 'target-companies') {
-    throw new Error(`payload.kind must be "linkedin" or "target-companies", got ${JSON.stringify(kind)}`);
+  if (kind !== 'linkedin' && kind !== 'target-companies' && kind !== 'vc' && kind !== 'semiconductor') {
+    throw new Error(`payload.kind must be "linkedin", "target-companies", "vc" or "semiconductor", got ${JSON.stringify(kind)}`);
   }
   if (!payload.runStartedAt) throw new Error('payload.runStartedAt is required');
 
@@ -331,6 +374,7 @@ export function buildReport(payload) {
 
   const historyText = existsSync(SCAN_HISTORY_PATH) ? readFileSync(SCAN_HISTORY_PATH, 'utf-8') : '';
   const candidates = resolveCandidates(historyText, urls).map(classifyCandidate);
+  if (kind === 'semiconductor') attachTitleLanes(candidates);
   const { pass, marginal, excluded } = bucketCandidates(candidates);
 
   const notes = [
@@ -358,6 +402,13 @@ export function buildReport(payload) {
       providerBacked: payload.cohort?.providerBacked || [],
       handoffAttempted: payload.cohort?.handoffAttempted || [],
       blockedUnresolved: payload.cohort?.blockedUnresolved || [],
+    } : kind === 'semiconductor' && payload.cohort ? {
+      total: payload.cohort.total ?? null,
+      providerBacked: payload.cohort.providerBacked || [],
+      fallbackBacked: payload.cohort.fallbackBacked || [],
+      deferred: payload.cohort.deferred || [],
+      providerFailures: payload.cohort.providerFailures || [],
+      fallbackFailures: payload.cohort.fallbackFailures || [],
     } : null,
     generatedAt: new Date().toISOString(),
   };

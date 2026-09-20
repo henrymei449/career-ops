@@ -539,7 +539,10 @@ title_filter:
     - "Head"
     - "Director"
 
-# -- Title filter overrides (optional, scan-ats-full.mjs only) --
+# -- Title filter overrides (optional; scan.mjs and scan-ats-full.mjs) --
+# scan.mjs matches `companies` against each tracked_companies entry's `name`
+# (exact, case-insensitive); scan-ats-full.mjs matches the dataset slug (below).
+#
 # The reverse ATS sweep (scan-ats-full.mjs) applies ONE global title_filter
 # to every company in the public dataset it walks. Some employers legitimately
 # deserve a WIDER title net than everyone else, without loosening the global
@@ -571,6 +574,52 @@ title_filter:
 #       - "Program Administrator"
 #       - "Registrar"
 #       - "Student Services"
+#
+# `positive_extra` keywords use the same syntax as title_filter.positive:
+# plain lowercase substring, `word:` for a whole-word match, and "A + B" for an
+# AND-group (BOTH terms must appear in the TITLE itself).
+
+# -- Title lanes (optional; scan.mjs) --
+# A title lane is a SEPARATE, company-scoped title gate layered on top of
+# title_filter (+ title_filter_overrides) without changing either. It is
+# consulted only for a title the existing gate rejected, so titles that already
+# pass are never affected. A lane admits a title only when ALL of these hold:
+#   - the company is listed in `companies` (exact, case-insensitive match on the
+#     tracked_companies `name`; a lane with no companies or no positives is ignored)
+#   - no global title_filter.negative keyword matches (unless listed in
+#     `global_negative_exceptions`, below)
+#   - no lane `negative` keyword matches (these apply to THIS lane only)
+#   - at least one lane `positive` keyword matches
+# Keyword syntax is the same as title_filter (substring, `word:`, "A + B").
+# A job admitted by a lane carries `title_lane=<name>` in its pipeline note, and
+# the discovery report shows it in a "Title Lane" column for semiconductor runs.
+#
+#   positive                    keywords that admit a title (required)
+#   negative                    lane-scoped vetoes (co-op, intern, and similar noise)
+#   global_negative_exceptions  exact global title_filter.negative entries this
+#                               lane does NOT inherit. The global list itself is
+#                               never modified; Lane-A-style gating and every
+#                               other lane still see all of it.
+#   fallback_queries            explicit search strings read ONLY by the
+#                               official-domain-search provider (see below); the
+#                               scan loop ignores this field
+#
+# title_filter_lanes:
+#   - name: example_lane
+#     companies: ["Example Corp", "Another Example Inc"]
+#     positive:
+#       - "quality engineer"
+#       - "word:lean"
+#       - "manufacturing + project manager"
+#     negative:
+#       - "co-op"
+#       - "coop"
+#       - "intern"
+#       - "technician"
+#     global_negative_exceptions:
+#       - "operations manager"
+#     fallback_queries:
+#       - '"Quality Engineer"'
 
 # -- Search queries --
 # Each query triggers a WebSearch. Use site: to filter by portal.
@@ -1527,6 +1576,51 @@ search_queries:
 #     careers_url: https://jobs.lever.co/someboard
 #     provider: lever
 #     aggregator: true
+
+# ── provider: official-domain-search (optional, per entry) ────────────
+# A bounded, query-first fallback for a company whose careers site has no
+# provider-backed scan. It is EXPLICIT-ONLY (never auto-detected): set
+# `provider: official-domain-search` plus an `official_domain_search` block.
+# Requires SERPER_API_KEY (search). It is not a crawler: it issues `site:`
+# search queries on the official domain, canonicalizes and de-duplicates the
+# result URLs, fetches a bounded number of pages, and keeps only live postings
+# that expose a real title. A location it cannot read is returned empty (unknown),
+# never guessed. Title/geography/dedup filtering still happens in scan.mjs.
+#
+# Queries come from two places, run in ONE pass (Lane A queries first):
+#   - title_filter_overrides `positive_extra` for this company ("A + B" becomes
+#     `"A" B`)
+#   - title_filter_lanes `fallback_queries` for lanes that list this company
+# With neither, the provider fails loudly instead of inventing queries.
+#
+# official_domain_search keys:
+#   host                  exact official/ATS host (required)
+#   path_prefix           tenant path scope on a shared ATS host
+#   query_scope           `site:` scope used in the QUERY only (default host+path_prefix)
+#   query_extra           literal marker added to every query
+#   job_path_re           regex for an individual posting URL path (required, case-insensitive)
+#   req_id_re             regex; capture group 1 = requisition id, used to de-duplicate
+#   strip_path_suffix_re  regex removed from the URL path end before canonicalizing
+#   lowercase_path        true only where the site's paths are case-insensitive
+#   prefer_re             when two URLs share a requisition id, keep the one matching this
+#   keep_params           query parameters that identify a posting (all others are dropped)
+#   require_json_ld       true: a page is live only with a schema.org JobPosting payload
+#   body_location         true: allow a conservative "City, State" read from the posting text
+#   max_queries           cap on Lane A style queries (default 30)
+#   max_lane_queries      cap on lane fallback_queries (default 10)
+#   max_unique            cap on unique candidate URLs (default 60)
+#   max_fetch             cap on pages fetched (default 40)
+#
+#   - name: Example Manufacturer
+#     careers_url: https://careers.example.com/
+#     provider: official-domain-search
+#     official_domain_search:
+#       host: careers.example.com
+#       path_prefix: /jobs
+#       job_path_re: '/jobs/posting/'
+#       req_id_re: '-(\d+)$'
+#       require_json_ld: true
+#       max_lane_queries: 8
 
 tracked_companies:
 

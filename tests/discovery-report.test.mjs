@@ -16,7 +16,7 @@ import { ROOT, NODE, rmSync } from './helpers.mjs';
 import {
   parseScanRunsTsv, rowsInWindow, sumScanRunRows,
   parseScanHistoryRows, resolveCandidates, classifyCandidate, bucketCandidates,
-  renderReport, stripBom,
+  renderReport, stripBom, attachTitleLanes,
 } from '../discovery-report.mjs';
 
 const SCAN_RUNS_HEADER = 'timestamp\tstatus\tcompanies\tboards\tfound\tfiltered_title\tfiltered_tier\tfiltered_location\tfiltered_posting_age\tfiltered_salary\tfiltered_content\tfiltered_cooldown\tdupes\tnew_added\terrors\tfiltered_blacklist\tfiltered_visa\tfiltered_posted_date\tfiltered_country_eligibility\n';
@@ -168,6 +168,46 @@ test('renderReport: target-companies kind includes the Employer Coverage section
 
   const linkedinMd = renderReport({ ...base, kind: 'linkedin', cohort: null });
   assert.doesNotMatch(linkedinMd, /Target Companies Employer Coverage/);
+});
+
+test('renderReport: semiconductor kind lists cohort coverage (provider / fallback / deferred / failures); other kinds do not', () => {
+  const base = {
+    date: '2026-09-19', runStartedAt: 'a', runFinishedAt: 'b', sinceDays: null, modelUsed: null,
+    funnel: { rawJobs: 0, freshnessRejects: 0, duplicates: 0, cheapFilterRejects: 0, netNew: 0 },
+    pass: [], marginal: [], excludedCount: 0, notes: [], generatedAt: '2026-09-19T23:00:00.000Z',
+  };
+  const md = renderReport({
+    ...base, kind: 'semiconductor',
+    cohort: {
+      total: 4, providerBacked: ['KLA Corporation'],
+      fallbackBacked: [{ name: 'Onto Innovation', path: 'official_domain_search' }],
+      deferred: [{ name: 'Advantest', status: 'DEFERRED', reason: 'NO_CURRENT_GEO_VALUE / ADP_EXTRACTION_UNSUPPORTED' }],
+      providerFailures: [], fallbackFailures: [{ name: 'HORIBA', error: 'search quota' }],
+    },
+  });
+  assert.match(md, /## 6\. Semiconductor Cohort Coverage/);
+  assert.match(md, /Total cohort: 4/);
+  assert.match(md, /Onto Innovation — official_domain_search/);
+  assert.match(md, /Advantest — DEFERRED \(NO_CURRENT_GEO_VALUE/);
+  assert.match(md, /Fallback failures: 1/);
+  assert.match(md, /HORIBA — search quota/);
+  assert.doesNotMatch(renderReport({ ...base, kind: 'vc', cohort: null }), /Semiconductor Cohort Coverage/);
+});
+
+test('attachTitleLanes: title_lane note in pipeline.md marks lane B; everything else is lane A; report shows a Title Lane column and summary', () => {
+  const cands = [{ url: 'https://e/1', company: 'Entegris', title: 'Production Supervisor' }, { url: 'https://e/2', company: 'Nova', title: 'Application Engineer' }];
+  const pipeline = '- [ ] https://e/1 | Entegris | Production Supervisor | discovery_lane=keyword — title_lane=semiconductor_lane_b\n- [ ] https://e/2 | Nova | Application Engineer | discovery_lane=keyword\n';
+  attachTitleLanes(cands, pipeline);
+  assert.deepEqual(cands.map((c) => c.lane), ['B', 'A']);
+  const row = (c) => ({ ...c, location: 'Reno, NV', tier: 5, bucket: 'primary', source: 's', why: 'w' });
+  const md = renderReport({
+    kind: 'semiconductor', date: '2026-09-19', runStartedAt: 'a', runFinishedAt: 'b', sinceDays: null, modelUsed: null,
+    funnel: { rawJobs: 0, freshnessRejects: 0, duplicates: 0, cheapFilterRejects: 0, netNew: 2 },
+    pass: cands.map(row), marginal: [], excludedCount: 0, notes: [], generatedAt: 'x',
+    cohort: { total: 1, providerBacked: [], fallbackBacked: [], deferred: [], providerFailures: [], fallbackFailures: [] },
+  });
+  assert.match(md, /Title Lane/);
+  assert.match(md, /Survivors by title lane: B 1, A 1/);
 });
 
 // ── buildReport() / CLI — subprocess against a fresh temp data root ────
