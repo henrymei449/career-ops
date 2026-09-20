@@ -1,4 +1,5 @@
-// Narrow checks for the unified-semiconductor expansion (Pass 1 + Pass 2, 2026-09-19/20):
+// Narrow checks for the semiconductor SUPPLIER cohort (fab-support + materials) and its boundary
+// with the 15-company equipment cohort (2026-09-20):
 // Qnity, Air Liquide, Solstice, EMD, Pfeiffer Vacuum (provider-backed) and
 // Edwards Vacuum, Henkel (official-domain-search) + Kurt J. Lesker, Brewer Science (local parsers).
 // MacDermid Alpha was evaluated and REMOVED.
@@ -19,9 +20,10 @@ const marker = join(REPO_ROOT, '.career-ops-data');
 const DATA_ROOT = process.env.CAREER_OPS_DATA_DIR
   || (existsSync(marker) ? readFileSync(marker, 'utf8').trim() : '');
 const PORTALS = join(DATA_ROOT || '.', 'portals.yml');
-const COHORT = join(DATA_ROOT || '.', 'semiconductor-15-companies.yml');
+const COHORT = join(DATA_ROOT || '.', 'semiconductor-15-companies.yml');          // equipment cohort (source `semiconductor`)
+const SUPPLIERS = join(DATA_ROOT || '.', 'semiconductor-suppliers-companies.yml'); // supplier cohort (source `semiconductor-suppliers`)
 const REPO = REPO_ROOT;
-const present = Boolean(DATA_ROOT) && existsSync(PORTALS) && existsSync(COHORT);
+const present = Boolean(DATA_ROOT) && existsSync(PORTALS) && existsSync(COHORT) && existsSync(SUPPLIERS);
 const opts = { skip: present ? false : 'data root portals.yml / cohort file not present' };
 
 const NEW = ['Qnity Electronics', 'Air Liquide', 'Solstice Advanced Materials', 'EMD Electronics', 'Pfeiffer Vacuum',
@@ -61,14 +63,71 @@ test('Pfeiffer is scoped to the /pfeiffervacuum/ brand path, never the bare Busc
   assert.equal(r.tileApi, 'https://jobs.buschvacuum.com/pfeiffervacuum/tile-search-results/');
 });
 
-test('unified cohort: 15 originals + 5 Pass 1 + 4 Pass 2 = 24, all resolvable, MacDermid absent', opts, () => {
-  const { cfg } = load();
-  const names = [...readFileSync(COHORT, 'utf8').matchAll(/^\s*-\s*name:\s*(.+?)\s*$/gm)].map((m) => m[1]);
-  assert.equal(names.length, 24);
+// ── Cohort boundary: equipment (15, source `semiconductor`) vs suppliers (9, source `semiconductor-suppliers`) ──
+const namesOf = (file) => [...readFileSync(file, 'utf8').matchAll(/^\s*-\s*name:\s*(.+?)\s*$/gm)].map((m) => m[1]);
+const ORIGINAL_15 = ['KLA Corporation', 'Applied Materials', 'Lam Research', 'ASML', 'Tokyo Electron', 'Onto Innovation', 'Veeco',
+  'Advantest', 'Inficon', 'MKS Instruments', 'Entegris', 'HORIBA', 'Nova', 'Camtek', 'PDF Solutions'];
+
+test('equipment cohort is exactly the original 15 and contains none of the supplier companies', opts, () => {
+  const names = namesOf(COHORT);
+  assert.equal(names.length, 15);
+  assert.deepEqual([...names].sort(), [...ORIGINAL_15].sort());
+  for (const n of NEW) assert.ok(!names.includes(n), `${n} must not be in the equipment cohort`);
+  assert.equal(names.filter((n) => n === 'MKS Instruments').length, 1);
+  assert.equal(names.filter((n) => n === 'Entegris').length, 1);
+});
+
+test('supplier cohort is exactly the 9 approved companies; MKS / Entegris / MacDermid are absent; no overlap with equipment', opts, () => {
+  const names = namesOf(SUPPLIERS);
+  assert.equal(names.length, 9);
+  assert.deepEqual([...names].sort(), [...NEW].sort());
+  for (const banned of ['MKS Instruments', 'Entegris']) assert.ok(!names.includes(banned), `${banned} stays equipment-only`);
   assert.ok(!names.some((n) => /macdermid/i.test(n)));
-  for (const n of NEW) assert.ok(names.includes(n), `cohort has ${n}`);
-  const tracked = new Set(cfg.tracked_companies.map((c) => c.name));
-  for (const n of names) assert.ok(tracked.has(n), `${n} resolves to a tracked_companies entry`);
+  assert.deepEqual(names.filter((n) => namesOf(COHORT).includes(n)), [], 'no company is in both cohorts');
+});
+
+test('supplier cohort discovery metadata matches portals.yml: 5 provider, 2 official-domain-search, 2 local-parser', opts, () => {
+  const { cfg } = load();
+  const text = readFileSync(SUPPLIERS, 'utf8');
+  const declared = Object.fromEntries(text.split(/^\s*-\s*name:\s*/m).slice(1).map((b) => {
+    const [first, ...rest] = b.split('\n');
+    return [first.trim(), (/^\s*discovery:\s*(.+?)\s*$/m.exec(rest.join('\n')) || [])[1] || 'provider'];
+  }));
+  const want = { 'Qnity Electronics': 'provider', 'Air Liquide': 'provider', 'Solstice Advanced Materials': 'provider',
+    'EMD Electronics': 'provider', 'Pfeiffer Vacuum': 'provider', 'Edwards Vacuum': 'official_domain_search',
+    Henkel: 'official_domain_search', 'Kurt J. Lesker': 'local_parser', 'Brewer Science': 'local_parser' };
+  assert.deepEqual(declared, want);
+  const tracked = new Map(cfg.tracked_companies.map((c) => [c.name, c]));
+  for (const [name, method] of Object.entries(declared)) {
+    const e = tracked.get(name);
+    assert.ok(e && e.enabled === true, `${name} resolves to an enabled tracked entry`);
+    const actual = e.provider === 'official-domain-search' ? 'official_domain_search' : e.scan_method === 'local_parser' ? 'local_parser' : 'provider';
+    assert.equal(actual, method, `${name}: declared discovery matches its portals.yml entry`);
+  }
+  const counts = Object.values(declared).reduce((m, v) => (m[v] = (m[v] || 0) + 1, m), {});
+  assert.deepEqual(counts, { provider: 5, official_domain_search: 2, local_parser: 2 });
+  // every equipment company still resolves too
+  for (const n of namesOf(COHORT)) assert.ok(tracked.has(n), `${n} resolves`);
+});
+
+test('runner / source / scheduler chain: equipment stays `semiconductor` on the original runner; suppliers are a separate unscheduled runner and source', opts, () => {
+  const eq = readFileSync(join(DATA_ROOT, 'run-semiconductor-cohort.mjs'), 'utf8');
+  assert.match(eq, /semiconductor-15-companies\.yml/);
+  assert.match(eq, /source: 'semiconductor'/);
+  assert.doesNotMatch(eq, /suppliers/i, 'equipment runner knows nothing about the supplier cohort');
+  const su = readFileSync(join(DATA_ROOT, 'run-semiconductor-suppliers-cohort.mjs'), 'utf8');
+  assert.match(su, /const SOURCE = 'semiconductor-suppliers'/);
+  assert.match(su, /semiconductor-suppliers-companies\.yml/);
+  assert.doesNotMatch(su, /semiconductor-15-companies\.yml['"]\)/, 'supplier runner does not read the equipment cohort file');
+  // scheduled wrapper still drives ONLY the original runner
+  const schedDir = join(DATA_ROOT, 'scheduler');
+  const wrapper = readFileSync(join(schedDir, 'scan-semiconductor.ps1'), 'utf8');
+  assert.match(wrapper, /run-semiconductor-cohort\.mjs/);
+  assert.doesNotMatch(wrapper, /suppliers/i);
+  assert.equal(existsSync(join(schedDir, 'scan-semiconductor-suppliers.ps1')), false, 'no supplier wrapper/scheduler exists yet');
+  for (const f of ['scan-linkedin.ps1', 'scan-target-companies.ps1', 'scan-vc-portfolio.ps1']) {
+    assert.doesNotMatch(readFileSync(join(schedDir, f), 'utf8'), /suppliers/i, `${f} does not run the supplier cohort`);
+  }
 });
 
 test('equipment-wide override block and Lane B are NOT polluted by the new companies', opts, () => {

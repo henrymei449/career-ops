@@ -194,6 +194,37 @@ test('renderReport: semiconductor kind lists cohort coverage (provider / fallbac
   assert.doesNotMatch(renderReport({ ...base, kind: 'vc', cohort: null }), /Semiconductor Cohort Coverage/);
 });
 
+test('renderReport: semiconductor-suppliers kind has its OWN coverage section (provider / fallback / local-parser / failures) and never the equipment one', () => {
+  const base = {
+    date: '2026-09-20', runStartedAt: 'a', runFinishedAt: 'b', sinceDays: null, modelUsed: null,
+    funnel: { rawJobs: 0, freshnessRejects: 0, duplicates: 0, cheapFilterRejects: 0, netNew: 0 },
+    pass: [], marginal: [], excludedCount: 0, notes: [], generatedAt: '2026-09-20T00:00:00.000Z',
+  };
+  const md = renderReport({
+    ...base, kind: 'semiconductor-suppliers',
+    cohort: {
+      total: 9, providerBacked: ['Qnity Electronics', 'Air Liquide'],
+      fallbackBacked: [{ name: 'Henkel', path: 'official_domain_search' }],
+      localParserBacked: ['Brewer Science'], deferred: [],
+      providerFailures: [], fallbackFailures: [{ name: 'Edwards Vacuum', error: 'search quota' }],
+      localParserFailures: [{ name: 'Kurt J. Lesker', error: 'parsed 0 jobs' }],
+    },
+  });
+  assert.match(md, /Semiconductor Suppliers Discovery/);
+  assert.match(md, /## 6\. Semiconductor Suppliers Cohort Coverage/);
+  assert.match(md, /Total supplier cohort: 9/);
+  assert.match(md, /Provider-backed: 2/);
+  assert.match(md, /Henkel — official_domain_search/);
+  assert.match(md, /Local-parser-backed: 1/);
+  assert.match(md, /Edwards Vacuum — search quota/);
+  assert.match(md, /Local-parser failures: 1/);
+  assert.match(md, /Kurt J\. Lesker — parsed 0 jobs/);
+  assert.doesNotMatch(md, /## 6\. Semiconductor Cohort Coverage/, 'never mixed into the equipment section');
+  // and the equipment kind does not grow a supplier section
+  const eq = renderReport({ ...base, kind: 'semiconductor', cohort: { total: 15, providerBacked: [], fallbackBacked: [], deferred: [], providerFailures: [], fallbackFailures: [] } });
+  assert.doesNotMatch(eq, /Suppliers Cohort Coverage|Local-parser/);
+});
+
 test('attachTitleLanes: title_lane note in pipeline.md marks lane B; everything else is lane A; report shows a Title Lane column and summary', () => {
   const cands = [{ url: 'https://e/1', company: 'Entegris', title: 'Production Supervisor' }, { url: 'https://e/2', company: 'Nova', title: 'Application Engineer' }];
   const pipeline = '- [ ] https://e/1 | Entegris | Production Supervisor | discovery_lane=keyword — title_lane=semiconductor_lane_b\n- [ ] https://e/2 | Nova | Application Engineer | discovery_lane=keyword\n';
