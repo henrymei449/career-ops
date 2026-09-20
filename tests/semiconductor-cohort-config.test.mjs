@@ -110,7 +110,7 @@ test('supplier cohort discovery metadata matches portals.yml: 5 provider, 2 offi
   for (const n of namesOf(COHORT)) assert.ok(tracked.has(n), `${n} resolves`);
 });
 
-test('runner / source / scheduler chain: equipment stays `semiconductor` on the original runner; suppliers are a separate unscheduled runner and source', opts, () => {
+test('runner / source / scheduler chain: equipment stays `semiconductor` on the original runner; suppliers are a separate runner, source and wrapper', opts, () => {
   const eq = readFileSync(join(DATA_ROOT, 'run-semiconductor-cohort.mjs'), 'utf8');
   assert.match(eq, /semiconductor-15-companies\.yml/);
   assert.match(eq, /source: 'semiconductor'/);
@@ -124,7 +124,8 @@ test('runner / source / scheduler chain: equipment stays `semiconductor` on the 
   const wrapper = readFileSync(join(schedDir, 'scan-semiconductor.ps1'), 'utf8');
   assert.match(wrapper, /run-semiconductor-cohort\.mjs/);
   assert.doesNotMatch(wrapper, /suppliers/i);
-  assert.equal(existsSync(join(schedDir, 'scan-semiconductor-suppliers.ps1')), false, 'no supplier wrapper/scheduler exists yet');
+  // the supplier cohort has its OWN wrapper (see semiconductor-suppliers-scheduler.test.mjs); the equipment wrapper never references it
+  assert.equal(existsSync(join(schedDir, 'scan-semiconductor-suppliers.ps1')), true, 'supplier wrapper exists');
   for (const f of ['scan-linkedin.ps1', 'scan-target-companies.ps1', 'scan-vc-portfolio.ps1']) {
     assert.doesNotMatch(readFileSync(join(schedDir, f), 'utf8'), /suppliers/i, `${f} does not run the supplier cohort`);
   }
