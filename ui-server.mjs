@@ -32,6 +32,10 @@ import {
   readJson,
   defaultState,
   finalizeAndIngestBatch,
+  INVESTIGATE_QUEUE_ID,
+  listInvestigateQueue,
+  decideInvestigateJob,
+  passJobFromBatch,
 } from './review.mjs';
 import {
   markApplied,
@@ -51,6 +55,7 @@ import {
   updateJobOperatingMetadata,
 } from './outreach.mjs';
 import { intakeJob } from './adhoc-intake.mjs';
+import { resolveResumeGateSop, gateCardView, startBatchGateRun, getBatchGateRun } from './resume-gate.mjs';
 import { APPLICATION_ALIVE_STATUSES, APPLICATION_CLOSED_STATUSES } from './application-schema.mjs';
 import { deriveOutreachCompletion, buildHomeRows, isOutreachNeeded } from './followup-schema.mjs';
 
@@ -102,6 +107,10 @@ export function listReviewJobsForBatch(batchId, root = DATA_ROOT) {
   if (batches.length === 0) return null;
   const batch = batchId ? batches.find((b) => b.batch_id === batchId) : batches[0];
   if (!batch) return null;
+  // Live SOP version, only so a stored gate result can be flagged stale when
+  // the SOP has moved on; an unreadable SOP just means "no stale flag".
+  let sop = null;
+  try { sop = resolveResumeGateSop({ root }); } catch { /* stale flag unavailable */ }
   return {
     batch_id: batch.batch_id,
     jobs: batch.jobs.map((job) => ({
@@ -114,6 +123,41 @@ export function listReviewJobsForBatch(batchId, root = DATA_ROOT) {
       proposed_decision: job.review.proposed_decision,
       reason: job.review.reason || '',
       final_decision: job.review.final_decision,
+      resume_gate: gateCardView(job, { root, sop }),
+    })),
+  };
+}
+
+/**
+ * The Investigate / Queue as ONE more entry in the batch selector — a virtual
+ * view over durable state (see review.mjs's listInvestigateQueue), not a batch
+ * file. Omitted when empty so the selector's default (newest open batch) and
+ * every existing batch summary are unchanged.
+ */
+export function investigateQueueSummary(root = DATA_ROOT) {
+  const count = listInvestigateQueue({ root }).length;
+  return count ? { batch_id: INVESTIGATE_QUEUE_ID, label: `Investigate / Queue — ${count} job${count === 1 ? '' : 's'}`, count, source: 'durable', virtual: true } : null;
+}
+
+/** Review-card projection of the queue: same shape as a batch job card, from durable state. */
+export function listInvestigateQueueJobs(root = DATA_ROOT) {
+  let sop = null;
+  try { sop = resolveResumeGateSop({ root }); } catch { /* stale flag unavailable */ }
+  return {
+    batch_id: INVESTIGATE_QUEUE_ID,
+    virtual: true,
+    jobs: listInvestigateQueue({ root }).map(({ job_key, durable, original }) => ({
+      batch_id: INVESTIGATE_QUEUE_ID,
+      job_key,
+      company: durable.company || original?.company || '',
+      title: durable.title || original?.title || '',
+      location: original?.location || '',
+      url: durable.url || original?.url || '',
+      proposed_decision: null,
+      reason: durable.reason || '',
+      final_decision: 'INVESTIGATE',
+      decided_at: durable.decided_at || null,
+      resume_gate: original ? gateCardView(original, { root, sop }) : null,
     })),
   };
 }
@@ -330,10 +374,27 @@ function serveStatic(req, res, urlPath) {
 }
 
 const API_ROUTES = [
-  ['GET', '/api/review/batches', async () => ({ batches: listOpenBatchSummaries() })],
+  ['GET', '/api/review/batches', async () => {
+    const queue = investigateQueueSummary();
+    return { batches: [...listOpenBatchSummaries(), ...(queue ? [queue] : [])] };
+  }],
   ['GET', '/api/review', async (body, query) => {
+    if (query.get('batch_id') === INVESTIGATE_QUEUE_ID) return listInvestigateQueueJobs();
     const result = listReviewJobsForBatch(query.get('batch_id'));
     return result || { batch_id: null, jobs: [] };
+  }],
+  // PASS is an immediate per-job disposition: durable PASS now, job leaves the open batch now.
+  ['POST', '/api/review/pass', async (body) => {
+    const { batch_id: batchId, job_key: jobKey } = body;
+    if (!batchId || !jobKey) throw new Error('batch_id and job_key required');
+    return passJobFromBatch(batchId, jobKey, { root: DATA_ROOT });
+  }],
+  // Re-decide one Investigate / Queue job in place (durable state only).
+  ['POST', '/api/review/investigate/decide', async (body) => {
+    const { job_key: jobKey, decision } = body;
+    if (!jobKey || !decision) throw new Error('job_key and decision required');
+    const { unchanged, job } = await decideInvestigateJob(jobKey, decision, { root: DATA_ROOT });
+    return { job_key: jobKey, unchanged, fit_decision: job.fit_decision, execution_status: job.execution_status };
   }],
   ['POST', '/api/review/finalize', async (body) => {
     const { batch_id: batchId, overrides = {}, reviewer } = body;
@@ -345,6 +406,20 @@ const API_ROUTES = [
       ingested: ingestion.ingested.includes(batchId),
       ingestion_errors: ingestion.errors,
     };
+  }],
+  // Resume Gate enrichment for the SELECTED batch only. Starts a background
+  // run and returns at once (a batch takes minutes); the UI polls the status
+  // route and re-reads /api/review, since each job's result is persisted as
+  // it completes. Never touches review decisions — see resume-gate.mjs.
+  ['POST', '/api/review/resume-gate', async (body) => {
+    const { batch_id: batchId, force = false } = body;
+    if (!batchId) throw new Error('batch_id required');
+    return startBatchGateRun(batchId, { root: DATA_ROOT, force: !!force });
+  }],
+  ['GET', '/api/review/resume-gate/status', async (body, query) => {
+    const batchId = query.get('batch_id');
+    if (!batchId) throw new Error('batch_id required');
+    return getBatchGateRun(batchId);
   }],
   ['GET', '/api/ready', async () => ({ jobs: listReadyToApply() })],
   ['POST', '/api/ready/applied', async (body) => {

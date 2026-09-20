@@ -145,7 +145,10 @@ addJobUrl.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submitAd
 // ── Review (batch-aware: exactly one open batch is shown/decided/finalized
 //    at a time — see docs/careerops-state-model.md's batch-scoping note) ──
 
+const INVESTIGATE_QUEUE_ID = 'investigate-queue'; // virtual batch: durable INVESTIGATE jobs, not a batch file
+
 function formatBatchLabel(b) {
+  if (b.label) return b.label; // virtual entries carry their own label (Investigate / Queue — N jobs)
   const when = b.created_at ? new Date(b.created_at).toLocaleString() : '(unknown time)';
   const src = b.source ? ` — ${b.source}` : '';
   return `${b.batch_id} — ${b.count} job${b.count === 1 ? '' : 's'}${src} — ${when}`;
@@ -197,13 +200,197 @@ async function loadReview() {
   listEl.innerHTML = '';
   if (jobs.length === 0) { listEl.appendChild(el('p', { class: 'empty', text: 'This batch has no jobs.' })); updateFinalizeButton(data.batch_id, []); return; }
 
+  const isQueue = data.batch_id === INVESTIGATE_QUEUE_ID;
   for (const job of jobs) {
-    if (!(job.job_key in state.reviewSelections) && job.proposed_decision) {
-      state.reviewSelections[job.job_key] = job.proposed_decision;
+    if (!(job.job_key in state.reviewSelections) && (job.proposed_decision || isQueue)) {
+      state.reviewSelections[job.job_key] = job.proposed_decision || job.final_decision;
     }
     listEl.appendChild(renderReviewCard(job));
   }
+  if (isQueue) { updateQueueControls(jobs); return; }
+  $('#finalize-btn').textContent = 'Finalize Batch';
   updateFinalizeButton(data.batch_id, jobs);
+  updateGateControls(data.batch_id, jobs);
+}
+
+// Investigate / Queue: each card's APPLY / INVESTIGATE / PASS selection is saved
+// in place on the durable record (POST /api/review/investigate/decide) — the
+// job then leaves the queue via the normal Ready to Apply / suppressed paths.
+function updateQueueControls(jobs) {
+  const btn = $('#finalize-btn');
+  const hint = $('#finalize-hint');
+  btn.textContent = 'Save Queue Decisions';
+  const changed = jobs.filter((j) => state.reviewSelections[j.job_key] && state.reviewSelections[j.job_key] !== 'INVESTIGATE');
+  btn.disabled = changed.length === 0;
+  hint.textContent = changed.length ? `${changed.length} change${changed.length === 1 ? '' : 's'} to save` : 'Choose APPLY or PASS on a card to move it out of the queue';
+  for (const id of ['#gate-run-btn', '#gate-force-btn']) { $(id).disabled = true; $(id).onclick = null; }
+  $('#gate-hint').textContent = 'Resume Gate results shown are from the original batch';
+  btn.onclick = async () => {
+    try {
+      for (const j of changed) {
+        await api('POST', '/api/review/investigate/decide', { job_key: j.job_key, decision: state.reviewSelections[j.job_key] });
+        delete state.reviewSelections[j.job_key];
+      }
+      loadReview();
+    } catch (e) { showError($('#review-list'), e.message); }
+  };
+}
+
+// ── Resume Gate (explicit, per selected batch; never changes decisions) ────
+
+const GATE_POLL_MS = 3000;
+const MAX_CARD_GAPS = 3;
+const CLIP = { why: 220, gap: 110, effort: 60 }; // fit_warning is deliberately never clipped
+const gateOpen = new Set(); // job_keys whose full Resume Gate view is expanded (survives re-render)
+let gatePollTimer = null;
+let gateResumeChecked = null;
+
+// A labelled field that owns its own wrapped block (label above, prose below).
+function gateBlock(label, value) {
+  const block = el('div', { class: 'gate-block' });
+  block.appendChild(el('div', { class: 'gate-label', text: label }));
+  block.appendChild(el('div', { class: 'gate-text', text: value }));
+  return block;
+}
+
+// Display-only: show just the first duration found ("about 20 minutes" -> "20 min") when the
+// stored text contains one; otherwise a clipped copy. The full text stays in Show Full Resume Gate.
+function shortEffort(text) {
+  const t = String(text ?? '').trim();
+  const m = /(\d+(?:\s*[-–]\s*\d+)?\s*\+?)\s*(minutes?|mins?|hours?|hrs?|h)\b/i.exec(t);
+  if (!m) return clip(t, CLIP.effort);
+  const unit = /^h/i.test(m[2]) ? 'hr' : 'min';
+  return `${m[1].replace(/\s+/g, '')} ${unit}`;
+}
+
+function joinItems(items, empty) { return items && items.length ? items.join('; ') : empty; }
+
+// Display-only shortening for the collapsed card. The stored gate result is
+// never shortened; "Show Full Resume Gate" renders it verbatim.
+function clip(text, max) {
+  const t = String(text ?? '').trim();
+  if (t.length <= max) return t;
+  const cut = t.slice(0, max);
+  const sp = cut.lastIndexOf(' ');
+  return `${(sp > max * 0.6 ? cut.slice(0, sp) : cut).replace(/[\s,;:.-]+$/, '')}…`;
+}
+
+// The complete persisted output exactly as the SOP returned it; if a record
+// predates raw_output, rebuild it from the stored structured fields instead.
+function fullGateText(g) {
+  if (g.raw_output) return g.raw_output;
+  const list = (a, ordered) => (a || []).map((x, i) => (ordered ? `${i + 1}. ${x}` : `- ${x}`)).join('\n');
+  return [
+    `RESUME ROUTE:\n${g.resume_route_label || g.resume_route}`, `WHY:\n${g.why}`, `RESUME GATE:\n${g.resume_gate}`, `ROLE FIT:\n${g.role_fit}`,
+    `STRONGEST EVIDENCE:\n${list(g.strongest_evidence)}`, `MATERIAL GAPS:\n${list(g.material_gaps)}`, `ATS / TERMINOLOGY:\n${list(g.ats_terminology)}`,
+    `PROPOSED EDITS:\n${list(g.proposed_edits, true)}`, `DO NOT CHANGE:\n${list(g.do_not_change)}`, `ESTIMATED EFFORT:\n${g.estimated_effort}`, `FIT WARNING:\n${g.fit_warning}`,
+  ].join('\n\n');
+}
+
+function renderGateBlock(g, jobKey) {
+  const box = el('div', { class: 'gate' });
+  if (!g) { box.classList.add('gate-blocked'); box.appendChild(el('div', { text: 'Resume Gate: not run' })); return box; }
+  if (g.gate_status === 'BLOCKED_MISSING_JD') {
+    box.classList.add('gate-blocked');
+    box.appendChild(el('div', { class: 'gate-head', text: 'GATE BLOCKED / MISSING JD' }));
+    box.appendChild(el('div', { text: `${g.gate_error || 'No JD could be resolved.'} The job stays in the batch.` }));
+    return box;
+  }
+  if (g.gate_status !== 'OK') {
+    box.classList.add('gate-error');
+    box.appendChild(el('div', { class: 'gate-head', text: 'GATE ERROR' }));
+    box.appendChild(el('div', { text: g.gate_error || 'Resume Gate failed.' }));
+    return box;
+  }
+  if (g.resume_gate === 'MAJOR TAILOR') box.classList.add('gate-warn');
+  // Presentation only: every value below is a display-side shortening of the
+  // stored gate result, which is never modified (see "Show Full Resume Gate").
+  const top = el('div', { class: 'gate-top' });
+  top.appendChild(el('span', { class: 'gate-label', text: 'Resume Gate:' }));
+  top.appendChild(el('span', { class: 'gate-value', text: ` ${g.resume_gate}` }));
+  if (g.stale) top.appendChild(el('span', { class: 'gate-stale', text: `STALE — ${g.stale_reason}` }));
+  box.appendChild(top);
+  // Reading order: concern -> reason -> gaps -> work. Route / Role Fit are secondary metadata.
+  const metaRow = el('div', { class: 'gate-meta' });
+  [['Route', g.resume_route], ['Role Fit', g.role_fit]].forEach(([label, value], i) => {
+    if (i) metaRow.appendChild(document.createTextNode(' · '));
+    const item = el('span', { class: 'gate-meta-item' });
+    item.appendChild(el('span', { class: 'gate-meta-label', text: `${label}:` }));
+    item.appendChild(document.createTextNode(` ${value}`));
+    metaRow.appendChild(item);
+  });
+  box.appendChild(metaRow);
+  // Never shortened: the complete stored warning (including "NONE"), wrapped to card width.
+  box.appendChild(gateBlock('FIT WARNING', String(g.fit_warning || 'NONE').trim()));
+  box.appendChild(gateBlock('WHY', clip(g.why, CLIP.why)));
+  const gaps = g.material_gaps || [];
+  const shown = gaps.slice(0, MAX_CARD_GAPS).map((x) => clip(x, CLIP.gap));
+  const more = gaps.length - shown.length;
+  box.appendChild(gateBlock('MATERIAL GAPS', `${joinItems(shown, 'None listed.')}${more > 0 ? ` (+${more} more)` : ''}`));
+  box.appendChild(gateBlock('ESTIMATED EFFORT', shortEffort(g.estimated_effort)));
+  if (g.last_attempt) {
+    box.appendChild(el('div', { class: 'gate-stale', text: `Latest re-run failed (${g.last_attempt.gate_status}); showing the previous successful result.` }));
+  }
+  const details = el('details');
+  if (jobKey && gateOpen.has(jobKey)) details.open = true;
+  details.addEventListener('toggle', () => { if (!jobKey) return; if (details.open) gateOpen.add(jobKey); else gateOpen.delete(jobKey); });
+  details.appendChild(el('summary', { text: 'Show Full Resume Gate' }));
+  const meta = [`SOP v${g.sop_version}`, g.gated_at ? `gated ${new Date(g.gated_at).toLocaleString()}` : '', g.jd_hash ? `JD ${g.jd_hash.slice(0, 8)}` : ''].filter(Boolean).join(' · ');
+  details.appendChild(el('div', { class: 'meta', text: meta }));
+  details.appendChild(el('pre', { class: 'gate-full', text: fullGateText(g) }));
+  box.appendChild(details);
+  return box;
+}
+
+function updateGateControls(batchId, jobs) {
+  const run = $('#gate-run-btn');
+  const force = $('#gate-force-btn');
+  const hint = $('#gate-hint');
+  const enabled = !!batchId && jobs.length > 0;
+  run.disabled = !enabled; force.disabled = !enabled;
+  if (!enabled) { hint.textContent = ''; run.onclick = null; force.onclick = null; return; }
+  const gated = jobs.filter((j) => j.resume_gate && j.resume_gate.gate_status === 'OK').length;
+  if (!gatePollTimer) hint.textContent = `${gated}/${jobs.length} gated in this batch`;
+  const start = async (forceRun) => {
+    try {
+      await api('POST', '/api/review/resume-gate', { batch_id: batchId, force: forceRun });
+      pollGateRun(batchId);
+    } catch (e) { showError($('#review-list'), e.message); }
+  };
+  run.onclick = () => start(false);
+  force.onclick = () => start(true);
+  // Reopened Review mid-run (page reload / batch switch): resume polling once per batch.
+  if (gateResumeChecked !== batchId) {
+    gateResumeChecked = batchId;
+    api('GET', `/api/review/resume-gate/status?batch_id=${encodeURIComponent(batchId)}`)
+      .then((r) => { if (r.status === 'running') pollGateRun(batchId); })
+      .catch(() => {});
+  }
+}
+
+function pollGateRun(batchId) {
+  clearTimeout(gatePollTimer);
+  const hint = $('#gate-hint');
+  const tick = async () => {
+    gatePollTimer = null;
+    if (state.selectedBatchId !== batchId) return; // user switched batch; its own controls take over
+    let r;
+    try { r = await api('GET', `/api/review/resume-gate/status?batch_id=${encodeURIComponent(batchId)}`); }
+    catch (e) { hint.textContent = `Resume Gate status unavailable: ${e.message}`; return; }
+    if (r.status === 'running') {
+      gatePollTimer = setTimeout(tick, GATE_POLL_MS);
+      await loadReview(); // each job's result is persisted as it completes
+      hint.textContent = `Running Resume Gate… ${r.completed}/${r.total}`;
+      $('#gate-run-btn').disabled = true; $('#gate-force-btn').disabled = true;
+      return;
+    }
+    await loadReview();
+    if (r.status === 'done' && r.summary) {
+      const s = r.summary;
+      hint.textContent = `Resume Gate done: ${s.gated} gated, ${s.cached} cached, ${s.blocked} blocked, ${s.errors} error${s.errors === 1 ? '' : 's'}`;
+    } else if (r.status === 'failed') hint.textContent = `Resume Gate failed: ${r.error}`;
+  };
+  tick();
 }
 
 function renderReviewCard(job) {
@@ -218,14 +405,27 @@ function renderReviewCard(job) {
   if (job.proposed_decision) {
     card.appendChild(el('div', { class: 'meta', text: `SOP proposed: ${job.proposed_decision}` }));
   }
+  if (job.batch_id === INVESTIGATE_QUEUE_ID && job.decided_at) {
+    card.appendChild(el('div', { class: 'meta', text: `In Investigate queue since ${new Date(job.decided_at).toLocaleString()}` }));
+  }
   if (job.reason) card.appendChild(el('div', { class: 'reason', text: job.reason }));
+  card.appendChild(renderGateBlock(job.resume_gate, job.job_key));
 
   const row = el('div', { class: 'row' });
   for (const decision of ['APPLY', 'INVESTIGATE', 'PASS']) {
     const btn = el('button', {
       class: `action${state.reviewSelections[job.job_key] === decision ? ' selected' : ''}`,
       text: decision,
-      onclick: () => {
+      onclick: async () => {
+        // In an OPEN batch, PASS is immediate: durable PASS now and the job leaves the batch.
+        if (decision === 'PASS' && job.batch_id !== INVESTIGATE_QUEUE_ID) {
+          try {
+            await api('POST', '/api/review/pass', { batch_id: job.batch_id, job_key: job.job_key });
+            delete state.reviewSelections[job.job_key];
+          } catch (e) { showError($('#review-list'), e.message); return; }
+          loadReview();
+          return;
+        }
         state.reviewSelections[job.job_key] = decision;
         loadReview();
       },

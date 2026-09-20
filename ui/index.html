@@ -97,6 +97,24 @@
   .status-form label { font-size: 12px; color: #666; width: 90px; flex-shrink: 0; }
   .status-form select, .status-form input[type="date"] { padding: 6px 8px; border-radius: 4px; border: 1px solid #ccc; font-size: 13px; }
   .status-form textarea { flex: 1; min-width: 220px; padding: 6px 8px; border-radius: 4px; border: 1px solid #ccc; font-size: 13px; font-family: inherit; }
+  .gate { border: 1px solid #dfe3e8; border-left: 4px solid #6b7c93; border-radius: 4px; padding: 8px 10px; margin-bottom: 10px; font-size: 13px; background: #fbfcfd; }
+  .gate.gate-warn { border-left-color: #c77700; background: #fff9ec; }
+  .gate.gate-blocked { border-left-color: #999; background: #f4f4f4; color: #555; }
+  .gate.gate-error { border-left-color: #b3261e; background: #fdf1f0; }
+  .gate { overflow-wrap: anywhere; min-width: 0; }
+  .gate .gate-head { font-weight: 700; margin-bottom: 4px; }
+  .gate .gate-label { font-weight: 700; color: #1c2b3a; }
+  .gate .gate-top { font-size: 15px; margin-bottom: 4px; }
+  .gate .gate-value { font-weight: 800; letter-spacing: 0.2px; }
+  .gate .gate-meta { font-size: 12px; color: #667; margin-bottom: 6px; }
+  .gate .gate-meta-label { font-weight: 600; }
+  .gate .gate-block .gate-label { font-size: 11px; letter-spacing: 0.5px; }
+  .gate .gate-block { margin: 6px 0; }
+  .gate .gate-text { font-weight: 400; line-height: 1.4; white-space: normal; }
+  .gate .gate-stale { color: #8a6300; font-weight: 600; margin-left: 6px; }
+  .gate details { margin-top: 6px; }
+  .gate details summary { cursor: pointer; color: #1c5fb4; }
+  .gate pre.gate-full { white-space: pre-wrap; word-break: break-word; margin: 6px 0 0; padding: 8px; background: #f4f6f8; border-radius: 4px; font: 12px/1.45 ui-monospace, Consolas, monospace; }
   .completion-pill { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; margin-left: 8px; background: #eef1f4; color: #444; }
   .completion-COMPLETE { background: #e3f6e8; color: #1a7d3a; }
   .completion-IN_PROGRESS { background: #fff4d9; color: #8a6300; }
@@ -128,6 +146,11 @@
     <div class="toolbar row">
       <button class="action primary" id="finalize-btn" disabled>Finalize Batch</button>
       <span id="finalize-hint" class="meta"></span>
+    </div>
+    <div class="toolbar row">
+      <button class="action" id="gate-run-btn" disabled>Run Resume Gate</button>
+      <button class="action" id="gate-force-btn" disabled title="Re-run every job in this batch even if its result is current">Re-run all</button>
+      <span id="gate-hint" class="meta"></span>
     </div>
     <div id="review-list"></div>
   </section>

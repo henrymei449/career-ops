@@ -628,6 +628,133 @@ export async function ingestFinalizedReviewBatches({ root = DATA_ROOT } = {}) {
   return { ingested, skipped, errors: validationErrors };
 }
 
+// ── Immediate PASS from an open batch ──────────────────────────────────────
+
+/**
+ * PASS one job of an OPEN batch right now: (1) write the normal durable PASS
+ * record (fit_decision=PASS, execution_status=NONE — the same record shape and
+ * suppression semantics ingestion writes, so discovery/dedupe treats it as
+ * rejected), then (2) remove the job from the open batch so it stops being
+ * reviewed or gated. No draft state, no finalize needed. The durable record is
+ * the surviving history; an emptied open batch file is deleted.
+ *
+ * Durable write comes FIRST: if the batch rewrite then fails, the job is in
+ * both places (detectable, and already suppressed) rather than in neither.
+ * Idempotent for a job whose durable record is already PASS; refuses to
+ * overwrite any other existing durable decision.
+ *
+ * @returns {Promise<{batch_id: string, job_key: string, remaining: number}>}
+ */
+export async function passJobFromBatch(batchId, jobKey, { root = DATA_ROOT } = {}) {
+  const p = ensureDirs(root);
+  const openPath = path.join(p.open, `${batchId}.json`);
+  const batch = readJson(openPath, null);
+  if (!batch) throw new Error(`passJobFromBatch: no open batch ${batchId}`);
+  const job = batch.jobs.find((j) => j.job_key === jobKey);
+  if (!job) throw new Error(`passJobFromBatch: ${jobKey} is not in open batch ${batchId}`);
+
+  await withPipelineLock(p.statePath, async () => {
+    const state = readJson(p.statePath, defaultState());
+    const existing = state.jobs[jobKey];
+    if (existing && existing.fit_decision !== 'PASS') {
+      throw new Error(`passJobFromBatch: ${jobKey} already has a durable ${existing.fit_decision} decision`);
+    }
+    if (!existing) {
+      const now = new Date().toISOString();
+      state.jobs[jobKey] = {
+        fit_decision: 'PASS',
+        execution_status: 'NONE',
+        reason: job.review?.reason || 'PASS from open review batch',
+        company: job.company,
+        title: job.title,
+        url: job.url,
+        batch_id: batchId,
+        decided_at: now,
+      };
+      state.updated_at = now;
+      atomicWriteFile(p.statePath, JSON.stringify(state, null, 2) + '\n');
+    }
+  });
+
+  const remaining = await withPipelineLock(openPath, async () => {
+    const fresh = readJson(openPath, null);
+    if (!fresh) return 0; // batch already gone (finalized meanwhile)
+    fresh.jobs = fresh.jobs.filter((j) => j.job_key !== jobKey);
+    if (fresh.jobs.length === 0) { try { unlinkSync(openPath); } catch { /* best-effort */ } return 0; }
+    const errors = validateBatch(fresh, 'proposed');
+    if (errors.length) throw new Error(`passJobFromBatch: batch would be invalid: ${errors.join('; ')}`);
+    atomicWriteFile(openPath, JSON.stringify(fresh, null, 2) + '\n');
+    return fresh.jobs.length;
+  });
+  return { batch_id: batchId, job_key: jobKey, remaining };
+}
+
+// ── Investigate / Queue (virtual view over durable state) ──────────────────
+// No storage of its own: the queue IS the durable jobs with
+// fit_decision=INVESTIGATE and execution_status=NONE. Nothing is copied into a
+// batch; the original processed/finalized batch file is only READ, to recover
+// display fields (location, Resume Gate result) the durable record omits.
+
+export const INVESTIGATE_QUEUE_ID = 'investigate-queue';
+
+function isInvestigateQueued(job) {
+  return job?.fit_decision === 'INVESTIGATE' && job?.execution_status === 'NONE';
+}
+
+/**
+ * @returns {Array<{job_key: string, durable: object, original: object|null}>}
+ *   newest decision first. `original` is the job record from the batch that
+ *   produced the decision (processed/, then finalized/), or null if that file
+ *   no longer exists.
+ */
+export function listInvestigateQueue({ root = DATA_ROOT } = {}) {
+  const p = reviewPaths(root);
+  const state = readJson(p.statePath, defaultState());
+  const cache = new Map();
+  const originalFor = (batchId, jobKey) => {
+    if (!batchId) return null;
+    if (!cache.has(batchId)) {
+      cache.set(batchId, readJson(path.join(p.processed, `${batchId}.json`), null) || readJson(path.join(p.finalized, `${batchId}.json`), null));
+    }
+    return cache.get(batchId)?.jobs?.find((j) => j.job_key === jobKey) || null;
+  };
+  return Object.entries(state.jobs || {})
+    .filter(([, j]) => isInvestigateQueued(j))
+    .map(([job_key, durable]) => ({ job_key, durable, original: originalFor(durable.batch_id, job_key) }))
+    .sort((a, b) => String(b.durable.decided_at || '').localeCompare(String(a.durable.decided_at || '')));
+}
+
+/**
+ * Re-decide ONE job that is sitting in the Investigate / Queue. Updates the
+ * SAME durable record in place (never a second record, never a batch edit),
+ * applying the exact mapping ingestFinalizedReviewBatches() uses:
+ *   APPLY -> fit_decision=APPLY, execution_status=READY_TO_APPLY (normal Ready to Apply path)
+ *   PASS  -> fit_decision=PASS,  execution_status=NONE           (normal suppressed path)
+ *   INVESTIGATE -> unchanged (stays queued)
+ * Refuses anything not currently INVESTIGATE/NONE, so it can never rewrite an
+ * APPLIED / NOT_APPLYING / PASS job.
+ */
+export async function decideInvestigateJob(jobKey, decision, { root = DATA_ROOT } = {}) {
+  if (!FIT_DECISIONS.includes(decision)) throw new Error(`decideInvestigateJob: invalid decision ${decision}`);
+  const p = ensureDirs(root);
+  return withPipelineLock(p.statePath, async () => {
+    const state = readJson(p.statePath, defaultState());
+    const job = state.jobs[jobKey];
+    if (!isInvestigateQueued(job)) throw new Error(`decideInvestigateJob: ${jobKey} is not in the Investigate / Queue`);
+    if (decision === 'INVESTIGATE') return { unchanged: true, job };
+    const now = new Date().toISOString();
+    job.fit_decision = decision;
+    job.execution_status = decision === 'APPLY' ? 'READY_TO_APPLY' : 'NONE';
+    job.reason = `${job.reason ? `${job.reason} ` : ''}[revisited from Investigate queue: was INVESTIGATE]`.trim();
+    job.decided_at = now;
+    job.revisited_from = 'INVESTIGATE';
+    job.revisited_at = now;
+    state.updated_at = now;
+    atomicWriteFile(p.statePath, JSON.stringify(state, null, 2) + '\n');
+    return { unchanged: false, job };
+  });
+}
+
 // ── CLI ──────────────────────────────────────────────────────────────────
 async function main() {
   const argv = process.argv.slice(2);
