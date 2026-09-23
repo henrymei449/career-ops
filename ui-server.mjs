@@ -581,7 +581,12 @@ const API_ROUTES = [
       { text, search_query: searchQuery, captured_at: capturedAt, html_links: Array.isArray(htmlLinks) ? htmlLinks : [] },
       { root: DATA_ROOT, dryRun: true, resolveOnline: false },
     );
-    const qualified = await qualifyLinkedInReceipt(discovery, { root: DATA_ROOT, titlePolicy: process.env.CAREER_OPS_LINKEDIN_TITLE_POLICY || 'existing', invoke: resolveLinkedInPasteEvaluator() });
+    // allowShadowTitleRules activates ONLY the validated, evidence-gated
+    // manufacturing title corrections from linkedin-title-shadow.mjs, as a
+    // fallback consulted after the production title_filter has already
+    // rejected on a hydrated JD — never scan.mjs/nightly discovery, which
+    // this option does not touch, and never portals.yml.
+    const qualified = await qualifyLinkedInReceipt(discovery, { root: DATA_ROOT, titlePolicy: process.env.CAREER_OPS_LINKEDIN_TITLE_POLICY || 'existing', invoke: resolveLinkedInPasteEvaluator(), allowShadowTitleRules: true });
     const items = qualified.rows.map((row) => ({
       company: row.company,
       title: row.title,

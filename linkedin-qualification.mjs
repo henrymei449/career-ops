@@ -31,6 +31,7 @@ import {
   atomicWriteFile,
 } from './scan.mjs';
 import { classifyGeography } from './location-tier.mjs';
+import { buildShadowTitleRule } from './linkedin-title-shadow.mjs';
 import { createBatchFromJobs } from './review.mjs';
 import { roleFuzzyMatch } from './role-matcher.mjs';
 import { flagValue } from './lib/cli-flags.mjs';
@@ -95,7 +96,7 @@ function buildNegativeOnlyGate(titleFilter, entries, resolveAliases = false) {
   };
 }
 
-export function evaluateExistingTitleGate(candidate, config = {}, { proposed = false } = {}) {
+export function evaluateExistingTitleGate(candidate, config = {}, { proposed = false, allowShadowTitleRules = false } = {}) {
   const title = cleanLinkedInTitle(candidate.title);
   const company = String(candidate.company || '').trim();
   const titleFilter = config.title_filter || {};
@@ -112,6 +113,21 @@ export function evaluateExistingTitleGate(candidate, config = {}, { proposed = f
   if (negatives.length) return { decision: 'REJECT', reason: 'existing_title_filter_negative_match', evidence: { title, company, matched_keywords: negatives } };
   // Manual discovery already has search context. Absence of a positive keyword
   // is insufficient evidence of a mismatch; defer role shape to existing triage.
+  //
+  // Shadow-rule fallback (manual-paste path ONLY — never scan.mjs/nightly
+  // discovery, and never when a caller wants the pure baseline verdict for
+  // audit comparison, i.e. row.baseline_title_gate below). Consulted only
+  // here, after the production gate has already rejected on no positive
+  // match, exactly matching linkedin-title-shadow.mjs's own contract: a
+  // narrow title pattern AND real JD evidence, never pattern alone. The
+  // shadow rule re-checks title_filter.negative itself, so a genuine
+  // negative-control title (Recruiter, Intern, etc.) cannot be admitted this
+  // way even if it happens to match a rule's title pattern.
+  if (allowShadowTitleRules && !proposed) {
+    const shadowRule = buildShadowTitleRule(config);
+    const shadowHit = shadowRule({ title: candidate.title, description: candidate.description || '' });
+    if (shadowHit) return { decision: 'PASS', reason: `shadow_title_rule:${shadowHit}`, evidence: { title, company, shadow_rule: shadowHit } };
+  }
   return { decision: proposed ? 'PASS' : 'REJECT', reason: proposed ? 'title_unknown_requires_jd_evaluation' : 'existing_title_filter_no_positive_match', evidence: { title, company, positive_match: false } };
 }
 
@@ -331,7 +347,8 @@ export async function qualifyLinkedInReceipt(receipt, opts = {}) {
       row.first_rule = gateTrace.find((g) => g.decision !== 'PASS'); row.audit_classification = classifyAudit(row); rows.push(row); continue;
     }
 
-    const titleGate = evaluateExistingTitleGate(candidate, config, {proposed: opts.titlePolicy === 'proposed'});
+    const titleGate = evaluateExistingTitleGate(candidate, config, {proposed: opts.titlePolicy === 'proposed', allowShadowTitleRules: !!opts.allowShadowTitleRules});
+    // Pure baseline, shadow rules OFF — the audit-trail comparison point.
     row.baseline_title_gate = evaluateExistingTitleGate(candidate, config);
     gateTrace.push({ gate: 'title', ...titleGate });
     if (titleGate.decision === 'REJECT' && !opts.auditTitleRejects) {

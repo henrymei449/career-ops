@@ -98,3 +98,50 @@ test('confirmed geography reject precedes title and spends no evaluation calls',
   assert.equal(result.rows[0].gate_trace.some(g=>g.gate==='title'),false);
   assert.equal(result.counts.llm_calls,0);
 });
+
+// ── Corrected manufacturing title rules (linkedin-title-shadow.mjs), opt-in
+// only via allowShadowTitleRules — this is the manual-paste-only wiring, not
+// a change to scan.mjs/nightly discovery or portals.yml.
+test('shadow title rule: a corrected title reaches PASS only with real JD evidence and the opt-in flag', () => {
+  const config = { title_filter: { positive: ['solutions architect'], negative: [] } };
+  const candidate = { title: 'Technical Account Manager', company: 'Tulip Interfaces', description: 'We bridge deep technical expertise and customer-facing success across our Industry 4.0 manufacturing MES platform.' };
+
+  // Off by default: production gate's verdict stands unchanged.
+  assert.equal(evaluateExistingTitleGate(candidate, config).decision, 'REJECT');
+  assert.equal(evaluateExistingTitleGate(candidate, config, { allowShadowTitleRules: false }).decision, 'REJECT');
+
+  // Opted in, with real JD evidence: the corrected rule fires.
+  const withShadow = evaluateExistingTitleGate(candidate, config, { allowShadowTitleRules: true });
+  assert.equal(withShadow.decision, 'PASS');
+  assert.equal(withShadow.reason, 'shadow_title_rule:technical_account_manager+technical+mfg');
+
+  // Same title, opted in, but NO JD evidence (pattern alone) — must not admit.
+  const noEvidence = evaluateExistingTitleGate({ ...candidate, description: '' }, config, { allowShadowTitleRules: true });
+  assert.equal(noEvidence.decision, 'REJECT');
+});
+
+test('shadow title rule never bypasses a negative-control title, even with matching JD evidence and the opt-in flag', () => {
+  const config = { title_filter: { positive: ['solutions architect'], negative: ['recruiter'] } };
+  const candidate = { title: 'Technical Account Manager / Recruiter', company: 'Tulip Interfaces', description: 'We bridge deep technical expertise and customer-facing success across our Industry 4.0 manufacturing MES platform.' };
+  const result = evaluateExistingTitleGate(candidate, config, { allowShadowTitleRules: true });
+  assert.equal(result.decision, 'REJECT');
+  assert.equal(result.reason, 'existing_title_filter_negative_match');
+});
+
+test('shadow title rule does not affect row.baseline_title_gate — the audit-trail comparison point stays pure', async () => {
+  const receipt = { receipt_id: 'shadow-baseline', items: [
+    { company: 'Tulip Interfaces', title: 'Technical Account Manager', location: 'United States', arrangement: 'Remote', outcome: 'would_add', reason: 'added_unresolved_url' },
+  ] };
+  const result = await qualifyLinkedInReceipt(receipt, {
+    root: 'unused', dryRun: true, allowShadowTitleRules: true,
+    config: { title_filter: { positive: ['solutions architect'], negative: [] }, pipeline: { triage_threshold: 3.5 } },
+    modeText: 'triage', briefText: 'brief',
+    resolve: async () => ({ status: 'resolved', url: 'https://jobs.example/tulip', attempts: [] }),
+    fetchJd: async () => ({ status: 'resolved', verified_url: 'https://jobs.example/tulip', source: 'test', text: 'This is a fully remote United States role. We bridge deep technical expertise and customer-facing success across our Industry 4.0 manufacturing MES platform. '.repeat(4) }),
+    invoke: async () => ({ text: 'TRIAGE: PASS | Tulip Interfaces | Technical Account Manager | 4.0/5 | Direct fit', cost_usd: 0, duration_ms: 1 }),
+  });
+  const row = result.rows[0];
+  assert.equal(row.gate_trace.find((g) => g.gate === 'title').reason, 'shadow_title_rule:technical_account_manager+technical+mfg');
+  assert.equal(row.baseline_title_gate.reason, 'existing_title_filter_no_positive_match');
+  assert.equal(row.baseline_title_gate.decision, 'REJECT');
+});
