@@ -262,15 +262,24 @@ function retryRecord(candidate, stage, reason, attempts = []) {
 // invokeClaudeTriage calls averaging ~12.4s each). Concurrency applies ONLY
 // to the invokeClaudeTriage stage -- URL resolution and JD enrichment stay
 // exactly as sequential as before; this file never touches that pacing.
-export const DEFAULT_CLAUDE_TRIAGE_CONCURRENCY = 2;
+//
+// Default raised from 2 to 4 (2026-09-23, #a85670e -> this change) after the
+// 2-vs-4-worker synthetic benchmark and full failure/safety suite showed
+// identical correctness (checkpointing, rate-limit handling, deterministic
+// gates) at both levels; 4 is also MAX_CLAUDE_TRIAGE_CONCURRENCY, so the
+// unset/invalid fallback and the hard ceiling are now the same value. An
+// explicit override (CLAUDE_TRIAGE_CONCURRENCY=1 or =2) still works exactly
+// as before -- this only changes what happens when nothing is set.
+export const DEFAULT_CLAUDE_TRIAGE_CONCURRENCY = 4;
 export const MAX_CLAUDE_TRIAGE_CONCURRENCY = 4;
 
 /**
  * Resolve the effective worker count for the Claude-triage stage from an
  * explicit override or CLAUDE_TRIAGE_CONCURRENCY. An unset, non-numeric,
  * non-integer, or out-of-range (<1) value falls back to the documented
- * default (2) rather than throwing or silently coercing to 1 -- never an
- * unbounded pool, and never a silent zero-worker deadlock.
+ * default (4) rather than throwing or silently coercing to 1 -- never an
+ * unbounded pool, and never a silent zero-worker deadlock. An explicit
+ * lower override (e.g. 1 or 2) is honored unchanged.
  * @param {string|number|undefined} value
  * @returns {number} an integer in [1, MAX_CLAUDE_TRIAGE_CONCURRENCY]
  */
