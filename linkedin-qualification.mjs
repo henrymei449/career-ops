@@ -257,6 +257,29 @@ function retryRecord(candidate, stage, reason, attempts = []) {
   };
 }
 
+// Bounded Claude-triage concurrency (2026-09-23 performance work, #real-run
+// measurement: 74% of a 123-card ingestion's wall-clock was sequential
+// invokeClaudeTriage calls averaging ~12.4s each). Concurrency applies ONLY
+// to the invokeClaudeTriage stage -- URL resolution and JD enrichment stay
+// exactly as sequential as before; this file never touches that pacing.
+export const DEFAULT_CLAUDE_TRIAGE_CONCURRENCY = 2;
+export const MAX_CLAUDE_TRIAGE_CONCURRENCY = 4;
+
+/**
+ * Resolve the effective worker count for the Claude-triage stage from an
+ * explicit override or CLAUDE_TRIAGE_CONCURRENCY. An unset, non-numeric,
+ * non-integer, or out-of-range (<1) value falls back to the documented
+ * default (2) rather than throwing or silently coercing to 1 -- never an
+ * unbounded pool, and never a silent zero-worker deadlock.
+ * @param {string|number|undefined} value
+ * @returns {number} an integer in [1, MAX_CLAUDE_TRIAGE_CONCURRENCY]
+ */
+export function resolveClaudeTriageConcurrency(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1) return DEFAULT_CLAUDE_TRIAGE_CONCURRENCY;
+  return Math.min(n, MAX_CLAUDE_TRIAGE_CONCURRENCY);
+}
+
 function classifyAudit(row) {
   if (row.initial_outcome !== 'excluded') return null;
   if (row.initial_reason === 'already_applied' && row.gate_trace.some((g) => g.gate === 'application_history' && g.decision === 'REJECT')) return 'TRUE_REJECT';
@@ -293,13 +316,41 @@ export async function qualifyLinkedInReceipt(receipt, opts = {}) {
   const briefText = opts.briefText ?? (existsSync(briefPath) ? readFileSync(briefPath, 'utf8') : '');
   if (!briefText) throw new Error(`CareerOps triage brief missing: ${briefPath}`);
   const threshold = Number(config?.pipeline?.triage_threshold || 3.5);
-  const rows = [];
-  const retries = [];
-  const survivors = [];
-  let evaluatorBlock = '';
+  // `rows` is index-preserving (rows[i] corresponds to receipt.items[i]) so
+  // Phase B can complete out of order under concurrency while the final
+  // receipt still reflects original source order, exactly as the old
+  // strictly-sequential loop did.
+  const rows = new Array(receipt.items.length).fill(null);
   const counts = { input: receipt.items.length, history_lookups: 0, searches: 0, jd_fetches: 0, llm_calls: 0, llm_succeeded: 0, llm_failed: 0, qualified: 0, rejected: 0, retry: 0 };
 
-  for (const source of receipt.items) {
+  // Serialized checkpoint writer: concurrent Phase-B completions each enqueue
+  // a snapshot write onto this single promise chain, so writes to
+  // `{receipt_id}-progress.json` are never interleaved and a later write can
+  // never lose an earlier worker's completed row -- `rows` only ever gains
+  // entries, never loses them, and this chain processes writes strictly in
+  // the order they were enqueued (which is the order rows were completed).
+  let checkpointChain = Promise.resolve();
+  function scheduleCheckpoint() {
+    if (opts.dryRun) return checkpointChain;
+    const snapshot = JSON.stringify({ counts, rows: rows.filter(Boolean), updated_at: new Date().toISOString() }, null, 2);
+    checkpointChain = checkpointChain.then(() => {
+      const checkpointDir = path.join(root, 'data', 'linkedin-qualification');
+      mkdirSync(checkpointDir, { recursive: true });
+      atomicWriteFile(path.join(checkpointDir, `${receipt.receipt_id}-progress.json`), snapshot);
+    });
+    return checkpointChain;
+  }
+
+  // ── Phase A: sequential deterministic gates (unchanged pacing/order) ────
+  // Dedup/history/suppression, URL resolution, JD enrichment, geography,
+  // then the corrected JD-evidenced title gate -- exactly the same order and
+  // the same resolve()/fetchJd() calls (never concurrent; LinkedIn lookup
+  // concurrency is untouched) as before this change. Anything that survives
+  // to the end of this phase is "eligible": it has already passed every
+  // deterministic gate and needs only the Claude verdict.
+  const pending = []; // { index, candidate, jd, geography, gateTrace }
+  for (let index = 0; index < receipt.items.length; index++) {
+    const source = receipt.items[index];
     const candidate = { ...source, title: cleanLinkedInTitle(source.title) };
     const gateTrace = [];
     if (source.reason === 'already_applied') gateTrace.push({ gate: 'application_history', decision: 'REJECT', evidence: source.detail || source.reason });
@@ -310,12 +361,12 @@ export async function qualifyLinkedInReceipt(receipt, opts = {}) {
     const row = { company: candidate.company, title: candidate.title, raw_title: source.title, location: candidate.location || '', candidate: { ...candidate }, initial_outcome: source.outcome, initial_reason: source.reason, gate_trace: gateTrace };
 
     if (gateTrace[0]?.decision === 'REJECT' && gateTrace[0].gate !== 'geography') {
-      row.status = 'REJECTED'; row.first_rule = gateTrace[0]; row.audit_classification = classifyAudit(row); counts.rejected++; rows.push(row); continue;
+      row.status = 'REJECTED'; row.first_rule = gateTrace[0]; row.audit_classification = classifyAudit(row); counts.rejected++; rows[index] = row; continue;
     }
     // Confirmed discovery geography rejects are terminal before any title test.
     if (source.reason === 'geography' && /^REJECT\b/.test(source.detail || '')) {
       gateTrace.push({gate:'geography',decision:'REJECT',evidence:source.detail});
-      row.status='REJECTED'; row.first_rule=gateTrace.at(-1); counts.rejected++; rows.push(row); continue;
+      row.status='REJECTED'; row.first_rule=gateTrace.at(-1); counts.rejected++; rows[index] = row; continue;
     }
 
     counts.history_lookups++;
@@ -323,7 +374,7 @@ export async function qualifyLinkedInReceipt(receipt, opts = {}) {
     counts.searches += (resolution.attempts || []).filter((a) => a.via === 'linkedin_search').length;
     gateTrace.push({ gate: 'identity_url', decision: resolution.status === 'resolved' ? 'PASS' : 'RETRY', evidence: resolution });
     if (resolution.status !== 'resolved' || !resolution.url) {
-      row.status = 'RETRY'; row.first_rule = gateTrace.find((g) => g.decision !== 'PASS'); row.retry = retryRecord(candidate, 'identity_url', resolution.status || 'unresolved', resolution.attempts); row.audit_classification = classifyAudit(row); retries.push(row.retry); counts.retry++; rows.push(row); continue;
+      row.status = 'RETRY'; row.first_rule = gateTrace.find((g) => g.decision !== 'PASS'); row.retry = retryRecord(candidate, 'identity_url', resolution.status || 'unresolved', resolution.attempts); row.audit_classification = classifyAudit(row); counts.retry++; rows[index] = row; continue;
     }
     candidate.url = resolution.url;
 
@@ -331,7 +382,7 @@ export async function qualifyLinkedInReceipt(receipt, opts = {}) {
     const jd = await fetchJd(resolution.url);
     gateTrace.push({ gate: 'jd_fetch', decision: jd.status === 'resolved' ? 'PASS' : 'RETRY', evidence: { source: jd.source || '', reason: jd.reason || '', chars: jd.text?.length || 0, verified_url: jd.verified_url || resolution.url } });
     if (jd.status !== 'resolved') {
-      row.status = 'RETRY'; row.url = resolution.url; row.first_rule = gateTrace.find((g) => g.decision !== 'PASS'); row.retry = retryRecord(candidate, 'jd_fetch', jd.reason || jd.status, resolution.attempts); row.audit_classification = classifyAudit(row); retries.push(row.retry); counts.retry++; rows.push(row); continue;
+      row.status = 'RETRY'; row.url = resolution.url; row.first_rule = gateTrace.find((g) => g.decision !== 'PASS'); row.retry = retryRecord(candidate, 'jd_fetch', jd.reason || jd.status, resolution.attempts); row.audit_classification = classifyAudit(row); counts.retry++; rows[index] = row; continue;
     }
     candidate.description = jd.text;
     candidate.url = jd.verified_url || resolution.url;
@@ -342,9 +393,9 @@ export async function qualifyLinkedInReceipt(receipt, opts = {}) {
     gateTrace.push({ gate: 'geography', decision: ACTIONABLE_GEOGRAPHY.has(geography.state) ? 'PASS' : (geography.state === 'UNKNOWN' ? 'RETRY' : 'REJECT'), evidence: geography });
     if (!ACTIONABLE_GEOGRAPHY.has(geography.state)) {
       if (geography.state === 'UNKNOWN') {
-        row.status = 'RETRY'; row.url = candidate.url; row.retry = retryRecord(candidate, 'geography', geography.reason, resolution.attempts); retries.push(row.retry); counts.retry++;
+        row.status = 'RETRY'; row.url = candidate.url; row.retry = retryRecord(candidate, 'geography', geography.reason, resolution.attempts); counts.retry++;
       } else { row.status = 'REJECTED'; counts.rejected++; }
-      row.first_rule = gateTrace.find((g) => g.decision !== 'PASS'); row.audit_classification = classifyAudit(row); rows.push(row); continue;
+      row.first_rule = gateTrace.find((g) => g.decision !== 'PASS'); row.audit_classification = classifyAudit(row); rows[index] = row; continue;
     }
 
     const titleGate = evaluateExistingTitleGate(candidate, config, {proposed: opts.titlePolicy === 'proposed', allowShadowTitleRules: !!opts.allowShadowTitleRules});
@@ -352,45 +403,90 @@ export async function qualifyLinkedInReceipt(receipt, opts = {}) {
     row.baseline_title_gate = evaluateExistingTitleGate(candidate, config);
     gateTrace.push({ gate: 'title', ...titleGate });
     if (titleGate.decision === 'REJECT' && !opts.auditTitleRejects) {
-      row.status = 'REJECTED'; row.first_rule = gateTrace.at(-1); counts.rejected++; rows.push(row); continue;
+      row.status = 'REJECTED'; row.first_rule = gateTrace.at(-1); counts.rejected++; rows[index] = row; continue;
     }
     if (titleGate.decision === 'REJECT') gateTrace.push({gate:'title_audit',decision:'PASS',evidence:'Shadow JD evaluation only; original title decision retained.'});
 
-    try {
-      if (evaluatorBlock) throw new Error(`Evaluator paused after provider limit: ${evaluatorBlock}`);
-      counts.llm_calls++;
-      const invoked = await invoke(buildTriagePrompt({ modeText, briefText, candidate, jdText: jd.text, threshold }), opts.invokeOptions || {});
-      const triage = parseTriageLine(invoked.text);
-      counts.llm_succeeded++;
-      row.triage = { ...triage, provider: invoked.provider || 'injected', usage: invoked.usage || null, cost_usd: invoked.cost_usd ?? null, duration_ms: invoked.duration_ms ?? null };
-      gateTrace.push({ gate: 'careerops_triage', decision: triage.verdict === 'PASS' ? 'PASS' : 'REJECT', evidence: { verdict: triage.verdict, score: triage.score, reason: triage.reason } });
-      if (triage.verdict === 'PASS') {
-        if (!ACTIONABLE_GEOGRAPHY.has(geography.state)) {
-          row.status = 'RETRY'; row.retry = retryRecord(candidate, 'geography', geography.reason, resolution.attempts); retries.push(row.retry); counts.retry++;
-        } else {
-          row.status = 'QUALIFIED'; counts.qualified++;
-          survivors.push({ ...candidate, source: 'linkedin_paste_qualified', intake: { kind: 'linkedin_paste', receipt_id: receipt.receipt_id, qualification: { score: triage.score, verdict: triage.verdict, reason: triage.reason, gate_trace: gateTrace } } });
-        }
-      } else { row.status = 'REJECTED'; counts.rejected++; }
-    } catch (e) {
-      if (!evaluatorBlock) counts.llm_failed++;
-      if (/usage limit|session limit|429|rate.limit/i.test(String(e?.message || e))) evaluatorBlock = String(e.message);
-      row.status = 'RETRY'; row.retry = retryRecord(candidate, 'careerops_triage', String(e?.message || e), resolution.attempts); retries.push(row.retry); counts.retry++;
-      gateTrace.push({ gate: 'careerops_triage', decision: 'RETRY', evidence: String(e?.message || e) });
+    // Eligible for Claude qualification — this is the ONLY gate a job must
+    // clear to enter Phase B; every gate above already ran, in order,
+    // sequentially, exactly as before.
+    pending.push({ index, candidate, jd, geography, gateTrace, resolution, row });
+  }
+
+  // ── Phase B: bounded concurrent Claude qualification ────────────────────
+  const concurrency = Math.min(resolveClaudeTriageConcurrency(opts.concurrency ?? process.env.CLAUDE_TRIAGE_CONCURRENCY), Math.max(1, pending.length) || 1);
+  let evaluatorBlock = '';
+  let cursor = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let rateLimited = false;
+
+  async function worker() {
+    while (true) {
+      const myIndex = cursor;
+      if (myIndex >= pending.length) return;
+      cursor += 1;
+      // Claim every remaining item even after evaluatorBlock is set — the
+      // try block below fails each one fast (no real invoke call, no
+      // counts.llm_calls increment) into a proper RETRY row instead of
+      // leaving it as a missing/null row. Already-running calls in OTHER
+      // workers are never touched; a 429 from one worker must not cancel
+      // three already-in-flight calls, only stop NEW real invocations.
+      const item = pending[myIndex];
+      const { candidate, jd, geography, gateTrace, resolution, row } = item;
+
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      try {
+        if (evaluatorBlock) throw new Error(`Evaluator paused after provider limit: ${evaluatorBlock}`);
+        counts.llm_calls++;
+        const invoked = await invoke(buildTriagePrompt({ modeText, briefText, candidate, jdText: jd.text, threshold }), opts.invokeOptions || {});
+        const triage = parseTriageLine(invoked.text);
+        counts.llm_succeeded++;
+        row.triage = { ...triage, provider: invoked.provider || 'injected', usage: invoked.usage || null, cost_usd: invoked.cost_usd ?? null, duration_ms: invoked.duration_ms ?? null };
+        gateTrace.push({ gate: 'careerops_triage', decision: triage.verdict === 'PASS' ? 'PASS' : 'REJECT', evidence: { verdict: triage.verdict, score: triage.score, reason: triage.reason } });
+        if (triage.verdict === 'PASS') {
+          if (!ACTIONABLE_GEOGRAPHY.has(geography.state)) {
+            row.status = 'RETRY'; row.retry = retryRecord(candidate, 'geography', geography.reason, resolution.attempts); counts.retry++;
+          } else {
+            row.status = 'QUALIFIED'; counts.qualified++;
+            row.survivor = { ...candidate, source: 'linkedin_paste_qualified', intake: { kind: 'linkedin_paste', receipt_id: receipt.receipt_id, qualification: { score: triage.score, verdict: triage.verdict, reason: triage.reason, gate_trace: gateTrace } } };
+          }
+        } else { row.status = 'REJECTED'; counts.rejected++; }
+      } catch (e) {
+        if (!evaluatorBlock) counts.llm_failed++;
+        const isRateLimit = /usage limit|session limit|429|rate.limit/i.test(String(e?.message || e));
+        if (isRateLimit) { evaluatorBlock = String(e.message); rateLimited = true; }
+        row.status = 'RETRY'; row.retry = retryRecord(candidate, 'careerops_triage', String(e?.message || e), resolution.attempts); counts.retry++;
+        gateTrace.push({ gate: 'careerops_triage', decision: 'RETRY', evidence: String(e?.message || e) });
+      } finally {
+        inFlight -= 1;
+      }
+      row.url = candidate.url;
+      row.first_rule = gateTrace.find((g) => g.decision !== 'PASS') || null;
+      row.audit_classification = classifyAudit(row);
+      rows[item.index] = row;
+      await scheduleCheckpoint();
     }
-    row.url = candidate.url;
-    row.first_rule = gateTrace.find((g) => g.decision !== 'PASS') || null;
-    row.audit_classification = classifyAudit(row);
-    rows.push(row);
-    if (!opts.dryRun) {
-      const checkpointDir = path.join(root, 'data', 'linkedin-qualification'); mkdirSync(checkpointDir, { recursive: true });
-      atomicWriteFile(path.join(checkpointDir, `${receipt.receipt_id}-progress.json`), JSON.stringify({ counts, rows, updated_at: new Date().toISOString() }, null, 2));
-    }
+  }
+
+  await Promise.all(Array.from({ length: Math.max(1, concurrency) }, () => worker()));
+  await checkpointChain; // make sure the last enqueued write has landed
+
+  // Reassemble retries/survivors in original receipt order (identical to
+  // what the old sequential push order produced), now that every row —
+  // Phase A terminal and Phase B concurrent — is settled.
+  const retries = [];
+  const survivors = [];
+  for (const row of rows) {
+    if (!row) continue; // defensive: should never happen once both phases finish
+    if (row.retry) retries.push(row.retry);
+    if (row.survivor) { survivors.push(row.survivor); delete row.survivor; }
   }
 
   let batchId = null;
   if (survivors.length && !opts.dryRun) batchId = createBatchFromJobs(survivors, { root, source: 'linkedin_paste_qualified' }).batchId;
-  const result = { schema_version: 1, receipt_id: receipt.receipt_id, source_batch_id: receipt.batch_id || null, created_at: new Date().toISOString(), batch_id: batchId, counts, rows, retry_queue: retries };
+  const result = { schema_version: 1, receipt_id: receipt.receipt_id, source_batch_id: receipt.batch_id || null, created_at: new Date().toISOString(), batch_id: batchId, counts: { ...counts, concurrency_used: concurrency, max_concurrent_observed: maxInFlight, rate_limited: rateLimited }, rows, retry_queue: retries };
   if (!opts.dryRun) {
     const dir = path.join(root, 'data', 'linkedin-qualification'); mkdirSync(dir, { recursive: true });
     atomicWriteFile(path.join(dir, `${receipt.receipt_id}.json`), JSON.stringify(result, null, 2) + '\n');

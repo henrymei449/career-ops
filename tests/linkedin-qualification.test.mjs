@@ -65,7 +65,7 @@ test('qualification sends only CareerOps PASS to Review and queues uncertainty',
       invoke: async () => ({ text: 'TRIAGE: PASS | Recovered Co | Solutions Architect | 4.4/5 | Direct manufacturing solutions fit', cost_usd: 0.01, duration_ms: 4 }),
     });
     assert.equal(resolves, 2, 'confirmed application-history reject does not consume search');
-    assert.deepEqual(result.counts, { input: 3, history_lookups: 2, searches: 2, jd_fetches: 1, llm_calls: 1, llm_succeeded: 1, llm_failed: 0, qualified: 1, rejected: 1, retry: 1 });
+    assert.deepEqual(result.counts, { input: 3, history_lookups: 2, searches: 2, jd_fetches: 1, llm_calls: 1, llm_succeeded: 1, llm_failed: 0, qualified: 1, rejected: 1, retry: 1, concurrency_used: 1, max_concurrent_observed: 1, rate_limited: false });
     assert.equal(result.batch_id, null);
     const recovered = result.rows.find((r) => r.company === 'Recovered Co');
     assert.equal(recovered.status, 'QUALIFIED');

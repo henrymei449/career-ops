@@ -148,6 +148,9 @@ async function main() {
   if (result.counts.parsed === 4) pass('all 4 pasted cards parsed');
   else fail(`expected 4 parsed cards, got ${result.counts.parsed}`);
 
+  if (typeof result.counts.concurrency_used === 'number' && result.counts.concurrency_used >= 1) pass('the real route surfaces the bounded Claude worker-pool concurrency used for this import');
+  else fail(`expected a numeric concurrency_used on the real route's response, got ${JSON.stringify(result.counts.concurrency_used)}`);
+
   const kinaxis = result.items.find((i) => i.company === 'Kinaxis');
   if (kinaxis && kinaxis.outcome === 'excluded' && kinaxis.reason === 'application_history') pass('duplicate/already-applied card excluded before geography/title/LLM');
   else fail(`Kinaxis row unexpected: ${JSON.stringify(kinaxis)}`);

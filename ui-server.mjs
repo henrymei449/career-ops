@@ -616,6 +616,12 @@ const API_ROUTES = [
         llm_calls: qualified.counts.llm_calls,
         llm_succeeded: qualified.counts.llm_succeeded,
         llm_failed: qualified.counts.llm_failed,
+        // Bounded concurrent Claude qualification (2026-09-23): the worker
+        // count actually used for this import, the maximum observed
+        // in-flight calls, and whether a rate limit was hit mid-run.
+        concurrency_used: qualified.counts.concurrency_used,
+        max_concurrent_observed: qualified.counts.max_concurrent_observed,
+        rate_limited: qualified.counts.rate_limited,
       },
       items,
       qualification: qualified,

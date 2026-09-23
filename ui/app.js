@@ -174,7 +174,14 @@ liText.addEventListener('paste', (ev) => {
 function renderLiReceipt(r) {
   liReceipt.innerHTML = '';
   const c = r.counts;
-  liReceipt.appendChild(el('div', { class: 'meta', text: `Parsed ${c.parsed} · Excluded ${c.excluded} · Qualified to Review ${c.added} · Retry queue ${c.unresolved} · Searches ${c.searches || 0} · JD fetches ${c.jd_fetches || 0} · Evaluations ${c.llm_succeeded || 0} completed / ${c.llm_calls || 0} attempted · Failures ${c.llm_failed || 0}${r.batch_id ? ` → ${r.batch_id}` : ''}` }));
+  liReceipt.appendChild(el('div', { class: 'meta', text: `Parsed ${c.parsed} · Excluded ${c.excluded} · Qualified to Review ${c.added} · Pending/retry queue ${c.unresolved} · Searches ${c.searches || 0} · JD fetches ${c.jd_fetches || 0} · Evaluations ${c.llm_succeeded || 0} completed / ${c.llm_calls || 0} attempted · Failures ${c.llm_failed || 0}${r.batch_id ? ` → ${r.batch_id}` : ''}` }));
+  // Bounded concurrent Claude qualification (2026-09-23): the request
+  // already completed by the time this renders (no live streaming), so
+  // "worker count" here means "used for this completed run", not a live gauge.
+  if (c.concurrency_used) {
+    const rateLimitNote = c.rate_limited ? ' · ⚠ Claude rate limit hit — remaining jobs preserved as retry, not repeated' : '';
+    liReceipt.appendChild(el('div', { class: 'meta', text: `Claude worker pool: ${c.concurrency_used} configured, ${c.max_concurrent_observed || 0} max concurrent observed${rateLimitNote}` }));
+  }
   const groups = [['added', 'Qualified to Review'], ['retry', 'Recoverable retry queue'], ['excluded', 'Excluded']];
   for (const [outcome, label] of groups) {
     const items = r.items.filter((i) => i.outcome === outcome);
