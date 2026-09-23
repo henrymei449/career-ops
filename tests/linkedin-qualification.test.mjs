@@ -145,3 +145,51 @@ test('shadow title rule does not affect row.baseline_title_gate — the audit-tr
   assert.equal(row.baseline_title_gate.reason, 'existing_title_filter_no_positive_match');
   assert.equal(row.baseline_title_gate.decision, 'REJECT');
 });
+
+// ── TAM/CSM/Customer Value Partner false negatives (2026-09-23 audit of
+// cached title rejects: Tractian, AssetWatch, Vontier/Driivz, iBase-t).
+// Descriptions below are representative paraphrases of the real evidence
+// (business-value/advisory language, no presales/demo vocabulary), not the
+// scraped JD text itself.
+test('shadow title rule recovers a manufacturing-reliability TAM/CSM/CVP false negative on advisory+value evidence, without presales/demo vocabulary', () => {
+  const config = { title_filter: { positive: ['solutions architect'], negative: [] } };
+  const tam = { title: 'Technical Account Manager', description: 'Our TAMs are trusted advisors who partner with maintenance and reliability teams at manufacturing facilities, driving account growth and measurable business outcomes.' };
+  const csm = { title: 'Customer Success Manager', description: 'Our Customer Success Managers are strategic advisors who help manufacturers achieve measurable business outcomes through the successful adoption of our predictive maintenance solutions.' };
+  const cvp = { title: 'Customer Value Partner', description: 'The Customer Value Partner owns the Value Realization Framework and ROI commitments for our Manufacturing Execution System (MES) customers in the aerospace manufacturing domain.' };
+  for (const candidate of [tam, csm, cvp]) {
+    const result = evaluateExistingTitleGate(candidate, config, { allowShadowTitleRules: true });
+    assert.equal(result.decision, 'PASS', `${candidate.title} should be recovered: ${JSON.stringify(result)}`);
+    assert.match(result.reason, /^shadow_title_rule:/);
+  }
+});
+
+test('shadow title rule leaves a domain-mismatched Customer Success Manager rejected (true negative, not manufacturing/reliability-adjacent)', () => {
+  const config = { title_filter: { positive: ['solutions architect'], negative: [] } };
+  // Same advisory/business-outcome language as the AssetWatch case, but a
+  // generic SaaS/API domain with no manufacturing, industrial, MES, EAM/CMMS
+  // or reliability signal anywhere — mfg(d) must be false, so this cannot be
+  // rescued by title+advisory language alone (models the real Driivz/Vontier
+  // "Technical Customer Success Manager" case, which stayed correctly
+  // rejected in production).
+  const candidate = { title: 'Technical Customer Success Manager', description: 'Serve as a trusted advisor to enterprise customers, driving adoption and business outcomes for our SaaS platform, working with APIs and third-party integrations.' };
+  const result = evaluateExistingTitleGate(candidate, config, { allowShadowTitleRules: true });
+  assert.equal(result.decision, 'REJECT');
+});
+
+test('shadow title rule never rescues routine support/ticket-handling language, even with a matching title and manufacturing domain', () => {
+  const config = { title_filter: { positive: ['solutions architect'], negative: [] } };
+  const candidate = { title: 'Customer Success Manager', description: 'Handle inbound support tickets from our manufacturing customers via the help desk, process refunds, and check order status in our tier-1 support queue.' };
+  const result = evaluateExistingTitleGate(candidate, config, { allowShadowTitleRules: true });
+  assert.equal(result.decision, 'REJECT');
+});
+
+test('GENERIC_SUPPORT_ONLY_RE does not falsely reject a legitimate advisory role that merely mentions support/onboarding as part of its duties', () => {
+  const config = { title_filter: { positive: ['solutions architect'], negative: [] } };
+  // "onboarding" and "technical support" appear here as ONE responsibility
+  // among many trusted-advisor/business-outcome duties -- not the whole job,
+  // unlike the pure ticket/help-desk case above. Must still be recovered.
+  const candidate = { title: 'Technical Account Manager', description: 'Our TAMs are trusted advisors who partner with manufacturing plant teams, leading customer onboarding, providing hands-on technical support during rollout, and driving account growth and measurable business outcomes through the customer lifecycle.' };
+  const result = evaluateExistingTitleGate(candidate, config, { allowShadowTitleRules: true });
+  assert.equal(result.decision, 'PASS', `legitimate advisory role incorrectly rejected: ${JSON.stringify(result)}`);
+  assert.match(result.reason, /^shadow_title_rule:/);
+});

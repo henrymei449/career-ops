@@ -138,6 +138,10 @@ export function listReviewJobsForBatch(batchId, root = DATA_ROOT) {
       compensation: job.compensation ?? null,
       posted_date: job.posted_date || '',
       intake: job.intake || null,
+      // Deterministic geography decision computeGateEvidence already stored
+      // at batch-build time (review-schema.mjs) — surfaced so a reviewer
+      // sees the JD-informed verdict, not just the raw listing location.
+      gates: job.gates || null,
       resume_gate: gateCardView(job, { root, sop }),
     })),
   };
@@ -172,6 +176,7 @@ export function listInvestigateQueueJobs(root = DATA_ROOT) {
       reason: durable.reason || '',
       final_decision: 'INVESTIGATE',
       decided_at: durable.decided_at || null,
+      gates: original?.gates || null,
       resume_gate: original ? gateCardView(original, { root, sop }) : null,
     })),
   };

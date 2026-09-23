@@ -215,6 +215,62 @@ $('#li-paste-submit').addEventListener('click', async () => {
   }
 });
 
+// Human labels for classifyGeography's {state, reason} — the exact,
+// deterministic (non-LLM) decision review-schema.mjs's computeGateEvidence
+// already stores on every job at batch-build time. Never invents a label
+// for an unrecognized reason code; falls back to the raw code rather than
+// guessing, so an unmapped code stays visibly a code, not a false claim.
+const GEOGRAPHY_STATE_LABELS = {
+  REMOTE_US: 'Remote — US (nationwide)',
+  NYC_COMPATIBLE: 'NYC-compatible (onsite/hybrid or remote)',
+  REJECT: 'Not eligible',
+  UNKNOWN: 'Pending — insufficient evidence',
+};
+const GEOGRAPHY_REASON_LABELS = {
+  'structured-remote': 'employer-confirmed fully remote (US)',
+  'structured-onsite-hybrid-nyc-actionable': 'onsite/hybrid, NYC-actionable location',
+  'location-tier-nyc-metro': 'NYC-metro location',
+  'location-tier-us-non-nyc': 'onsite/hybrid, US, outside NYC-actionable area',
+  'location-tier-needs-validation': 'needs manual validation',
+  'non-us-location': 'non-US location',
+  'remote-new-york-excluded': 'remote, but excludes New York residents',
+  'remote-residency-excludes-new-york': 'remote, residency restriction excludes New York',
+  'remote-residency-unresolved': 'remote — residency requirement unresolved',
+  'remote-territory-residency-unresolved': 'remote — residency state list unresolved',
+  'remote-onsite-or-proximity-unresolved': 'remote vs. onsite/proximity requirement unresolved',
+  'remote-conflicting-evidence': 'conflicting remote/onsite signals in the JD',
+  'no-structured-workplace-signal': 'no structured remote/onsite signal found',
+  'conflicting-workplace-signals': 'conflicting structured workplace signals',
+};
+
+/**
+ * Renders the LinkedIn-listed location/arrangement alongside the separate,
+ * JD-informed geography decision — so a genuinely US-remote role (JD says
+ * "Remote — United States") never reads as ineligible just because the
+ * LinkedIn card's location field shows the employer's HQ city (e.g.
+ * "San Mateo, CA"). Never claims a state is "JD-verified" beyond what
+ * classifyGeography actually returned; UNKNOWN always renders as pending,
+ * never as an eligible or ineligible verdict.
+ */
+function renderGeographyEvidence(job, card) {
+  const geo = job.gates && job.gates.geography;
+  const wrap = el('div', { class: 'meta geography-evidence' });
+  const linkedinLocation = job.location || '(location unknown)';
+  const statedArrangement = job.intake && job.intake.kind === 'linkedin_paste' ? job.intake.arrangement : '';
+  wrap.appendChild(el('div', { text: `LinkedIn listing: ${linkedinLocation}${statedArrangement ? ` (${statedArrangement})` : ''}` }));
+  if (geo && geo.state) {
+    const stateLabel = GEOGRAPHY_STATE_LABELS[geo.state] || geo.state;
+    const reasonLabel = GEOGRAPHY_REASON_LABELS[geo.reason] || geo.reason || '';
+    const verdict = el('div', { text: `Geographic eligibility: ${stateLabel}${reasonLabel ? ` — ${reasonLabel}` : ''}` });
+    if (geo.state === 'REMOTE_US' || geo.state === 'NYC_COMPATIBLE') verdict.style.color = '#1a7f37';
+    else if (geo.state === 'REJECT') verdict.style.color = '#b42318';
+    wrap.appendChild(verdict);
+  } else {
+    wrap.appendChild(el('div', { text: 'Geographic eligibility: not yet evaluated' }));
+  }
+  card.appendChild(wrap);
+}
+
 function renderPasteMeta(job, card) {
   const i = job.intake;
   if (!i || i.kind !== 'linkedin_paste') return;
@@ -495,7 +551,7 @@ function pollGateRun(batchId) {
 function renderReviewCard(job) {
   const card = el('div', { class: 'card' });
   card.appendChild(el('h3', { text: `${job.company} — ${job.title}` }));
-  card.appendChild(el('div', { class: 'meta', text: `${job.location || '(location unknown)'}${job.url ? '' : ''}` }));
+  renderGeographyEvidence(job, card);
   if (job.url) {
     const link = el('div', { class: 'meta' });
     link.appendChild(el('a', { href: job.url, target: '_blank', rel: 'noopener', text: job.url }));

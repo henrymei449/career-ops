@@ -498,6 +498,17 @@ export async function importLinkedInPaste(input = {}, opts = {}) {
   }
 
   // 2. History, suppression, geography — in that order, first hit wins.
+  //
+  // DEFERRED BACKLOG (2026-09-23, not yet investigated — do not block a
+  // release on this): Oden Technologies resurfaced in a live-ingestion
+  // Review batch despite an earlier application, i.e. one of the
+  // already_applied checks below should have matched and didn't. Root
+  // cause not yet diagnosed (candidate: company/role/place normalization
+  // mismatch between the tracker/review-state record and the freshly
+  // pasted card — e.g. a title or location variant `identityOf()` doesn't
+  // treat as equivalent). Activation threshold: investigate once more than
+  // 2-3 previously-applied jobs incorrectly resurface in a single import
+  // batch; a single occurrence isn't yet a pattern worth chasing.
   const survivors = [];
   for (const { card, id } of unique) {
     const url = linkedinJobUrl(card.linkedin_job_id);
