@@ -55,6 +55,8 @@ import {
   updateJobOperatingMetadata,
 } from './outreach.mjs';
 import { intakeJob } from './adhoc-intake.mjs';
+import { importLinkedInPaste, setManualJobUrl } from './linkedin-paste-intake.mjs';
+import { qualifyLinkedInReceipt, invokeClaudeTriage } from './linkedin-qualification.mjs';
 import { resolveResumeGateSop, gateCardView, startBatchGateRun, getBatchGateRun } from './resume-gate.mjs';
 import { APPLICATION_ALIVE_STATUSES, APPLICATION_CLOSED_STATUSES } from './application-schema.mjs';
 import { deriveOutreachCompletion, buildHomeRows, isOutreachNeeded } from './followup-schema.mjs';
@@ -62,6 +64,16 @@ import { deriveOutreachCompletion, buildHomeRows, isOutreachNeeded } from './fol
 const DATA_ROOT = getCareerOpsRoot();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'ui');
+
+// qualifyLinkedInReceipt defaults to invokeCodexTriage when no `invoke` is
+// supplied. The Operator UI's manual-paste evaluator has always been the
+// CareerOps Claude triage contract (matching the standalone/batch
+// qualification path), never Codex, so the route must resolve it explicitly
+// rather than rely on that default. Exported so a test can assert the wiring
+// without spawning a real CLI process.
+export function resolveLinkedInPasteEvaluator() {
+  return invokeClaudeTriage;
+}
 
 // ── Read helpers (pure reads over existing storage — no new state) ─────────
 
@@ -123,6 +135,9 @@ export function listReviewJobsForBatch(batchId, root = DATA_ROOT) {
       proposed_decision: job.review.proposed_decision,
       reason: job.review.reason || '',
       final_decision: job.review.final_decision,
+      compensation: job.compensation ?? null,
+      posted_date: job.posted_date || '',
+      intake: job.intake || null,
       resume_gate: gateCardView(job, { root, sop }),
     })),
   };
@@ -552,10 +567,69 @@ const API_ROUTES = [
     if (!url) throw new Error('url required');
     return intakeJob(url, { root: DATA_ROOT });
   }],
+  // Manual LinkedIn results paste: parse -> the same dedupe/history/
+  // suppression/geography contracts -> ONE normal open Review batch. All
+  // logic lives in linkedin-paste-intake.mjs; this route only forwards.
+  ['POST', '/api/review/linkedin-paste', async (body) => {
+    const { text, search_query: searchQuery, captured_at: capturedAt, html_links: htmlLinks, resolve_online: resolveOnline } = body;
+    if (!String(text || '').trim()) throw new Error('paste text required');
+    // Paste is upstream discovery, never direct Review admission. The dry-run
+    // receipt preserves all source rows and the existing cheap-gate result;
+    // qualification then resolves identity/JD, runs CareerOps triage, queues
+    // uncertainty, and creates Review only from qualified survivors.
+    const discovery = await importLinkedInPaste(
+      { text, search_query: searchQuery, captured_at: capturedAt, html_links: Array.isArray(htmlLinks) ? htmlLinks : [] },
+      { root: DATA_ROOT, dryRun: true, resolveOnline: false },
+    );
+    const qualified = await qualifyLinkedInReceipt(discovery, { root: DATA_ROOT, titlePolicy: process.env.CAREER_OPS_LINKEDIN_TITLE_POLICY || 'existing', invoke: resolveLinkedInPasteEvaluator() });
+    const items = qualified.rows.map((row) => ({
+      company: row.company,
+      title: row.title,
+      location: row.location,
+      outcome: row.status === 'QUALIFIED' ? 'added' : (row.status === 'RETRY' ? 'retry' : 'excluded'),
+      reason: row.status === 'QUALIFIED' ? 'careerops_qualified' : (row.first_rule?.gate || row.initial_reason || 'rejected'),
+      detail: row.triage?.reason || row.retry?.reason || row.first_rule?.evidence?.reason || '',
+      url: row.url || '',
+      audit_classification: row.audit_classification,
+    }));
+    return {
+      receipt_id: discovery.receipt_id,
+      batch_id: qualified.batch_id,
+      counts: {
+        parsed: qualified.counts.input,
+        duplicate: discovery.counts.duplicate,
+        excluded: qualified.counts.rejected,
+        unresolved: qualified.counts.retry,
+        added: qualified.counts.qualified,
+        searches: qualified.counts.searches,
+        jd_fetches: qualified.counts.jd_fetches,
+        llm_calls: qualified.counts.llm_calls,
+        llm_succeeded: qualified.counts.llm_succeeded,
+        llm_failed: qualified.counts.llm_failed,
+      },
+      items,
+      qualification: qualified,
+    };
+  }],
+  // Manual exact-URL entry for a pasted job whose link could not be resolved.
+  ['POST', '/api/review/set-url', async (body) => {
+    const { batch_id: batchId, job_key: jobKey, url } = body;
+    if (!batchId || !jobKey || !url) throw new Error('batch_id, job_key and url required');
+    return setManualJobUrl(batchId, jobKey, url, { root: DATA_ROOT });
+  }],
 ];
 
 function matchRoute(method, urlPath) {
   return API_ROUTES.find(([m, p]) => m === method && p === urlPath);
+}
+
+/** Exposes the exact [method, path, handler] route the real HTTP server
+ * dispatches to, so an isolated acceptance test can call the actual
+ * production route function directly instead of re-implementing it. */
+export function getApiRoute(method, urlPath) {
+  const route = matchRoute(method, urlPath);
+  if (!route) throw new Error(`no route ${method} ${urlPath}`);
+  return route[2];
 }
 
 async function handleApi(req, res, urlPath, query) {

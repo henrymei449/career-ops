@@ -118,6 +118,10 @@ export function buildJobRecord(job = {}) {
         : { mode: 'none' },
     gates: computeGateEvidence(job),
     review: freshReview(),
+    // Source-specific provenance (e.g. linkedin-paste-intake.mjs's search
+    // query, card labels, URL-resolution status). Carried verbatim; nothing
+    // in the lifecycle reads it for a decision.
+    ...(job.intake && typeof job.intake === 'object' ? { intake: job.intake } : {}),
   };
 }
 

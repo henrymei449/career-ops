@@ -142,6 +142,105 @@ async function submitAddJob() {
 addJobSubmit.addEventListener('click', submitAddJob);
 addJobUrl.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submitAddJob(); });
 
+// ── LinkedIn results paste: many result pages -> POST /api/review/linkedin-paste
+//    -> linkedin-paste-intake.mjs -> ONE normal open Review batch. The browser
+//    only collects the paste (plus any job links in the clipboard's HTML
+//    flavour, which the server attaches to a card only on a unique title
+//    match) and renders the receipt; no qualification happens here.
+const liPanel = $('#li-paste-panel');
+const liText = $('#li-paste-text');
+const liStatus = $('#li-paste-status');
+const liReceipt = $('#li-paste-receipt');
+let liHtmlLinks = [];
+
+$('#li-paste-btn').addEventListener('click', () => {
+  const showing = liPanel.style.display !== 'none';
+  liPanel.style.display = showing ? 'none' : '';
+  if (!showing) {
+    if (!$('#li-paste-captured').value) $('#li-paste-captured').value = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+    liText.focus();
+  }
+});
+
+liText.addEventListener('paste', (ev) => {
+  const html = ev.clipboardData && ev.clipboardData.getData('text/html');
+  if (!html) return;
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  for (const a of doc.querySelectorAll('a[href*="/jobs/view/"]')) {
+    liHtmlLinks.push({ url: a.href, text: (a.textContent || '').trim() });
+  }
+});
+
+function renderLiReceipt(r) {
+  liReceipt.innerHTML = '';
+  const c = r.counts;
+  liReceipt.appendChild(el('div', { class: 'meta', text: `Parsed ${c.parsed} · Excluded ${c.excluded} · Qualified to Review ${c.added} · Retry queue ${c.unresolved} · Searches ${c.searches || 0} · JD fetches ${c.jd_fetches || 0} · Evaluations ${c.llm_succeeded || 0} completed / ${c.llm_calls || 0} attempted · Failures ${c.llm_failed || 0}${r.batch_id ? ` → ${r.batch_id}` : ''}` }));
+  const groups = [['added', 'Qualified to Review'], ['retry', 'Recoverable retry queue'], ['excluded', 'Excluded']];
+  for (const [outcome, label] of groups) {
+    const items = r.items.filter((i) => i.outcome === outcome);
+    if (!items.length) continue;
+    const details = el('details');
+    details.appendChild(el('summary', { text: `${label} (${items.length})` }));
+    for (const i of items) {
+      const why = outcome === 'added' ? `CareerOps qualified${i.url ? ' · verified link' : ''}` : `${i.reason}${i.detail ? `: ${i.detail}` : ''}${i.audit_classification ? ` · ${i.audit_classification}` : ''}`;
+      details.appendChild(el('div', { class: 'meta', text: `${i.company} — ${i.title} — ${i.location || '?'}${i.arrangement ? ` (${i.arrangement})` : ''} · ${why}` }));
+    }
+    liReceipt.appendChild(details);
+  }
+}
+
+$('#li-paste-submit').addEventListener('click', async () => {
+  const text = liText.value;
+  if (!text.trim()) { liStatus.textContent = 'Paste LinkedIn results first.'; return; }
+  const captured = $('#li-paste-captured').value;
+  $('#li-paste-submit').disabled = true;
+  liStatus.textContent = 'Importing…';
+  try {
+    const r = await api('POST', '/api/review/linkedin-paste', {
+      text,
+      search_query: $('#li-paste-query').value.trim(),
+      captured_at: captured ? new Date(captured).toISOString() : null,
+      html_links: liHtmlLinks,
+      resolve_online: $('#li-paste-online').checked,
+    });
+    liStatus.textContent = r.counts.llm_failed ? `Qualification incomplete: ${r.counts.llm_failed} evaluator failures saved for retry.` : (r.batch_id ? 'Qualified batch created.' : (r.counts.unresolved ? 'No Review batch yet; unresolved jobs saved for retry.' : 'Completed: no jobs qualified.'));
+    renderLiReceipt(r);
+    liText.value = '';
+    liHtmlLinks = [];
+    if (r.batch_id) { state.selectedBatchId = r.batch_id; loadReview(); }
+  } catch (e) {
+    liStatus.textContent = e.message;
+  } finally {
+    $('#li-paste-submit').disabled = false;
+  }
+});
+
+function renderPasteMeta(job, card) {
+  const i = job.intake;
+  if (!i || i.kind !== 'linkedin_paste') return;
+  const bits = [i.arrangement, job.compensation, i.posting_age, (i.labels || []).join(', ')].filter(Boolean);
+  if (bits.length) card.appendChild(el('div', { class: 'meta', text: bits.join(' · ') }));
+  card.appendChild(el('div', { class: 'meta', text: `LinkedIn paste${i.search_query ? ` — "${i.search_query}"` : ''}${i.captured_at ? ` — captured ${new Date(i.captured_at).toLocaleString()}` : ''}` }));
+  if (job.url || job.batch_id === INVESTIGATE_QUEUE_ID) return;
+  const row = el('div', { class: 'row' });
+  row.appendChild(el('span', { class: 'meta', text: 'Exact job URL unresolved:' }));
+  const input = el('input', { type: 'url', placeholder: 'https://www.linkedin.com/jobs/view/…', style: 'flex: 1; min-width: 220px; padding: 4px 8px; border-radius: 4px; border: 1px solid #ccc; font-size: 12px;' });
+  row.appendChild(input);
+  row.appendChild(el('button', {
+    class: 'action',
+    text: 'Save URL',
+    onclick: async () => {
+      if (!input.value.trim()) return;
+      try {
+        const r = await api('POST', '/api/review/set-url', { batch_id: job.batch_id, job_key: job.job_key, url: input.value.trim() });
+        if (r.outcome === 'conflict') { showError($('#review-list'), `That URL already belongs to a known job (${r.state}${r.batch_id ? `, ${r.batch_id}` : ''}: ${r.summary.company} — ${r.summary.title}). Not merged.`); return; }
+        loadReview();
+      } catch (e) { showError($('#review-list'), e.message); }
+    },
+  }));
+  card.appendChild(row);
+}
+
 // ── Review (batch-aware: exactly one open batch is shown/decided/finalized
 //    at a time — see docs/careerops-state-model.md's batch-scoping note) ──
 
@@ -402,6 +501,7 @@ function renderReviewCard(job) {
     link.appendChild(el('a', { href: job.url, target: '_blank', rel: 'noopener', text: job.url }));
     card.appendChild(link);
   }
+  renderPasteMeta(job, card);
   if (job.proposed_decision) {
     card.appendChild(el('div', { class: 'meta', text: `SOP proposed: ${job.proposed_decision}` }));
   }

@@ -138,6 +138,21 @@
       <input type="url" id="add-job-url" placeholder="https://... job posting URL" style="display:none; flex: 1; min-width: 260px; padding: 6px 10px; border-radius: 4px; border: 1px solid #ccc; font-size: 13px;">
       <button class="action primary" id="add-job-submit" style="display:none">Intake</button>
       <span id="add-job-status" class="meta"></span>
+      <button class="action" id="li-paste-btn">Paste LinkedIn Results</button>
+    </div>
+    <div id="li-paste-panel" class="card" style="display:none">
+      <div class="row">
+        <input type="text" id="li-paste-query" placeholder="LinkedIn search query" style="flex: 1; min-width: 220px; padding: 6px 10px; border-radius: 4px; border: 1px solid #ccc; font-size: 13px;">
+        <label class="meta" for="li-paste-captured">Captured</label>
+        <input type="datetime-local" id="li-paste-captured" style="padding: 5px 8px; border-radius: 4px; border: 1px solid #ccc; font-size: 13px;">
+      </div>
+      <textarea id="li-paste-text" rows="10" placeholder="Select all on each LinkedIn results page, copy, and paste here. Several pages can be pasted one after another." style="width: 100%; box-sizing: border-box; margin: 8px 0; padding: 8px; border-radius: 4px; border: 1px solid #ccc; font: 12px/1.4 ui-monospace, Consolas, monospace;"></textarea>
+      <div class="row">
+        <label class="meta"><input type="checkbox" id="li-paste-online" checked disabled> Resolve links and JDs automatically; uncertainty goes to retry</label>
+        <button class="action primary" id="li-paste-submit">Qualify for Review</button>
+        <span id="li-paste-status" class="meta"></span>
+      </div>
+      <div id="li-paste-receipt"></div>
     </div>
     <div class="toolbar row">
       <label for="batch-select" class="meta">Review Batch:</label>
