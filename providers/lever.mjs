@@ -4,6 +4,17 @@
 // Lever provider — hits the public postings endpoint.
 // Auto-detects from careers_url via jobs.(eu.)?lever.co/<slug>.
 // Handles both explicit `api:` URLs and auto-detection from `careers_url`.
+//
+// The v0 postings list ships every posting's full description in one payload,
+// so it can run past the global 10s default (providers/_http.mjs) and abort
+// with no status — one such abort (Machina Labs, 2026-10-17) left a company's
+// raw count unknown and failed a whole strict discovery night. Same remedy as
+// ashby.mjs: a longer per-request timeout plus the shared bounded retry, which
+// still never re-asks a board that answered a deterministic 4xx.
+import { fetchJsonWithRetry } from './_http.mjs';
+
+const LEVER_TIMEOUT_MS = 30_000;
+const LEVER_RETRIES = 2;
 
 const ALLOWED_LEVER_HOSTS = new Set(['api.lever.co', 'api.eu.lever.co']);
 
@@ -79,7 +90,12 @@ export default {
     const apiUrl = resolveApiUrl(entry);
     if (!apiUrl) throw new Error(`lever: cannot derive API URL for ${entry.name}`);
     assertLeverUrl(apiUrl);
-    const json = await ctx.fetchJson(apiUrl, { redirect: 'error' });
+    const json = await fetchJsonWithRetry(
+      ctx,
+      apiUrl,
+      { timeoutMs: LEVER_TIMEOUT_MS, redirect: 'error' },
+      { retries: LEVER_RETRIES },
+    );
     if (!Array.isArray(json)) return [];
     return json.map(j => ({
       title: j.text || '',

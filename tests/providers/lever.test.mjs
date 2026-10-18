@@ -272,6 +272,45 @@ try {
     }
   }
 
+  // Transient abort → retried with the longer timeout (Machina Labs, 2026-10-17:
+  // one 10s abort left the company's raw count unknown and failed the night).
+  {
+    let calls = 0;
+    let seenTimeout;
+    const jobs = await lever.fetch(
+      { name: 'Slow', careers_url: 'https://jobs.lever.co/slow' },
+      {
+        sleep: async () => {},
+        fetchJson: async (url, opts) => {
+          calls++;
+          seenTimeout = opts?.timeoutMs;
+          if (calls === 1) throw Object.assign(new Error('This operation was aborted'), { name: 'AbortError' });
+          return [{ text: 'Engineer', hostedUrl: 'https://jobs.lever.co/slow/1' }];
+        },
+      },
+    );
+    if (calls === 2 && jobs.length === 1 && seenTimeout === 30_000) {
+      pass('lever.fetch() retries a transient abort and requests a 30s timeout');
+    } else {
+      fail(`lever.fetch() abort retry: calls=${calls} jobs=${jobs.length} timeoutMs=${seenTimeout}`);
+    }
+  }
+
+  // Deterministic 404 → asked once, never retried.
+  {
+    let calls = 0;
+    try {
+      await lever.fetch(
+        { name: 'Gone', careers_url: 'https://jobs.lever.co/gone' },
+        { sleep: async () => {}, fetchJson: async () => { calls++; throw Object.assign(new Error('HTTP 404'), { status: 404 }); } },
+      );
+      fail('lever.fetch() should rethrow a 404');
+    } catch (e) {
+      if (calls === 1 && /404/.test(e.message)) pass('lever.fetch() does not retry a 404');
+      else fail(`lever.fetch() 404: calls=${calls} error=${e.message}`);
+    }
+  }
+
 } catch (e) {
   fail(`lever provider tests crashed: ${e.message}`);
 }
